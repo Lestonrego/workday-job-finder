@@ -58,7 +58,7 @@ def main():
 
     # Automatically search public web indexes for Workday employers. Manual seed URLs
     # remain optional and are merged with search-discovered candidates.
-    max_discovered = int(os.environ.get("MAX_DISCOVERED_SITES", "30"))
+    max_discovered = int(os.environ.get("MAX_DISCOVERED_SITES", "5000"))
     discovered = discover_workday_sites_from_search(max_sites=max_discovered)
     seed_sites = list(dict.fromkeys(sites + discovered))
     if not seed_sites:
@@ -80,7 +80,7 @@ def main():
 
     for site in sites:
         try:
-            jobs = fetch_workday_jobs(site, max_jobs=int(os.environ.get("MAX_JOBS_PER_SITE", "10000")))
+            jobs = fetch_workday_jobs(site, max_jobs=int(os.environ.get("MAX_JOBS_PER_SITE", "100000")))
             print(f"{site}: collected {len(jobs)} listings")
             for job in jobs:
                 total += 1

@@ -199,8 +199,12 @@ def enrich_workday_job(job):
         return job
 
 
-def fetch_workday_jobs(career_url, max_jobs=10000):
-    """Fetch every listing page up to the tenant's reported total or max_jobs safety cap."""
+def fetch_workday_jobs(career_url, max_jobs=100000):
+    """Fetch pages until Workday returns no listings or the safety cap is reached.
+
+    Some Workday tenants incorrectly report total=0 on later pages, so a zero or
+    missing total must not terminate pagination while postings are still returned.
+    """
     cfg = parse_workday_url(career_url)
     results = []
     offset = 0
@@ -210,18 +214,27 @@ def fetch_workday_jobs(career_url, max_jobs=10000):
     while offset < max_jobs:
         payload = {"appliedFacets": {}, "limit": PAGE_SIZE, "offset": offset, "searchText": ""}
         response = None
-        for attempt in range(4):
+        max_attempts = 8
+        for attempt in range(max_attempts):
             try:
                 response = session.post(cfg["api"], json=payload, headers=HEADERS, timeout=30)
                 if response.status_code == 429 or response.status_code >= 500:
-                    time.sleep(2 * (attempt + 1))
+                    wait = min(60, 2 ** attempt)
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = max(wait, min(120, float(retry_after)))
+                        except ValueError:
+                            pass
+                    print(f"  Workday API returned {response.status_code}; retry {attempt + 1}/{max_attempts} in {wait:.1f}s")
+                    time.sleep(wait)
                     continue
                 response.raise_for_status()
                 break
             except Exception:
-                if attempt == 3:
+                if attempt == max_attempts - 1:
                     raise
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(min(60, 2 ** attempt))
         data = response.json()
         postings = data.get("jobPostings") or []
         if not postings:
@@ -261,11 +274,14 @@ def fetch_workday_jobs(career_url, max_jobs=10000):
         print(f"  Page offset {offset - len(postings)}: {len(postings)} listings; total reported: {total if total is not None else 'unknown'}")
         if len(postings) < PAGE_SIZE:
             break
-        if isinstance(total, int) and offset >= total:
+        # Workday occasionally reports total=0 on offset > 0 despite returning jobs.
+        # Only trust a positive total as an end condition.
+        if isinstance(total, int) and total > 0 and offset >= total:
             break
         if len(results) >= max_jobs:
             print(f"  Reached MAX_JOBS_PER_SITE safety cap ({max_jobs}). Increase it to scan more listings.")
             break
-        time.sleep(0.15)
+        # Small pause reduces pressure on public Workday endpoints.
+        time.sleep(0.35)
 
     return results
