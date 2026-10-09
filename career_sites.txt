@@ -1,0 +1,4 @@
+# Optional: add known employer Workday career URLs, one per line.
+# Automatic public-web discovery runs even when this file is empty.
+# Adding seed URLs can improve coverage for employers search engines do not surface.
+# Example: https://company.wd5.myworkdayjobs.com/en-US/External
