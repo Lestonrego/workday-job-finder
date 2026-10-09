@@ -29,6 +29,20 @@ QUERIES = [
 ]
 
 
+# Verified public Workday career-site roots used only when search engines return no results.
+# These are seed employers, not an exhaustive directory; discovery still probes their APIs.
+FALLBACK_WORKDAY_SITES = [
+    "https://alcon.wd5.myworkdayjobs.com/en-US/careers_alcon",
+    "https://iqvia.wd1.myworkdayjobs.com/en-US/IQVIA",
+    "https://automationanywhere.wd5.myworkdayjobs.com/en-US/AutomationAnywhereJobs",
+    "https://wf.wd1.myworkdayjobs.com/en-US/wellsfargojobs",
+    "https://wri.wd501.myworkdayjobs.com/en-US/WRI",
+    "https://globalfoundries.wd1.myworkdayjobs.com/en-US/External",
+    "https://walmart.wd504.myworkdayjobs.com/en-US/walmartexternal",
+    "https://collaborative.wd1.myworkdayjobs.com/en-US/AllOpenings",
+]
+
+
 def _unwrap_ddg(href):
     if href.startswith("//"):
         href = "https:" + href
@@ -60,37 +74,55 @@ def _career_root(url):
 
 
 def discover_workday_sites_from_search(max_sites=30):
-    """Search the public web for Workday-hosted career sites relevant to India roles."""
+    """Find public Workday career sites using several public search engines.
+
+    Search engines can block automated requests. If they return no results, use a small
+    set of known public Workday career-site roots as seeds; workday.py validates each
+    seed against its public jobs API before scanning it.
+    """
     session = requests.Session()
     found = {}
     max_sites = max(1, int(max_sites))
-    for query in QUERIES:
+    providers = [
+        ("DuckDuckGo", "https://html.duckduckgo.com/html/", "q"),
+        ("Bing", "https://www.bing.com/search", "q"),
+    ]
+    for provider_name, endpoint, query_param in providers:
+        for query in QUERIES:
+            if len(found) >= max_sites:
+                break
+            try:
+                response = session.get(
+                    endpoint,
+                    params={query_param: query},
+                    headers=HEADERS,
+                    timeout=20,
+                )
+                if response.status_code in (403, 429):
+                    print(f"{provider_name} rate-limited discovery (HTTP {response.status_code}); trying another source.")
+                    break
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, "html.parser")
+                for anchor in soup.select("a.result__a, li.b_algo h2 a, a[href]"):
+                    href = anchor.get("href", "")
+                    root = _career_root(href)
+                    if root:
+                        found.setdefault(root.lower(), root)
+                        if len(found) >= max_sites:
+                            break
+            except Exception as exc:
+                print(f"{provider_name} discovery failed for one query: {exc}")
+            time.sleep(0.5)
         if len(found) >= max_sites:
             break
-        try:
-            response = session.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query},
-                headers=HEADERS,
-                timeout=20,
-            )
-            if response.status_code in (403, 429):
-                print(f"Search provider rate-limited discovery (HTTP {response.status_code}); keeping results found so far.")
-                break
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            for anchor in soup.select("a.result__a, a[href]"):
-                href = anchor.get("href", "")
-                root = _career_root(href)
-                if root:
-                    found.setdefault(root.lower(), root)
-                    if len(found) >= max_sites:
-                        break
-        except Exception as exc:
-            print(f"Public search discovery failed for one query: {exc}")
-        time.sleep(1.0)
-    results = list(found.values())
-    print(f"Automatic discovery found {len(results)} distinct Workday career-site URL(s).")
+
+    if not found:
+        print("Public search engines returned no usable Workday sites; adding fallback seed sites for API validation.")
+        for url in FALLBACK_WORKDAY_SITES[:max_sites]:
+            found.setdefault(url.lower(), url)
+
+    results = list(found.values())[:max_sites]
+    print(f"Automatic discovery produced {len(results)} Workday career-site candidate URL(s) for validation.")
     for url in results:
-        print(f"Discovered candidate: {url}")
+        print(f"Discovery candidate: {url}")
     return results

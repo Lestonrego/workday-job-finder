@@ -63,8 +63,8 @@ def main():
     seed_sites = list(dict.fromkeys(sites + discovered))
     if not seed_sites:
         raise RuntimeError(
-            "Automatic discovery returned no Workday career sites and career_sites.txt is empty. "
-            "Try again later or add a few seed URLs to career_sites.txt."
+            "Automatic discovery and fallback seeds returned no candidates. "
+            "Check public search access in the Actions logs and retry the workflow."
         )
 
     # Confirm candidates against Workday's public jobs API and probe related career paths.

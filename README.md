@@ -57,3 +57,7 @@ Enable Actions and run **Scheduled Workday Job Scan → Run workflow** once to t
 - The location filter is intentionally India-focused and conservative. Add city aliases to `is_india_location()` in `scanner.py if you want more Indian locations included.
 - Some Workday sites do not expose full descriptions, so the model may need to mark eligibility as uncertain.
 - The scanner records opportunities; it does not submit applications automatically.
+
+
+### Automatic discovery fallback
+The scanner searches public search engines first. If they block automated requests or return no usable results, it tries a small built-in set of public Workday career-site seed URLs and validates each against the site's public jobs API. This improves resilience but is not a complete directory of all Workday employers. `career_sites.txt` remains optional and can be left empty.
