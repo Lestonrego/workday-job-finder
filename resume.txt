@@ -1,0 +1,2 @@
+PASTE YOUR RESUME TEXT HERE BEFORE THE FIRST RUN.
+You can replace this file with your updated resume text at any time using GitHub's web editor.

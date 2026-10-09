@@ -1,0 +1,8 @@
+Target Google Sheet:
+https://docs.google.com/spreadsheets/d/1g-WPpI9YSVbcTPtIeZPO0FHLel_CTGZXgaOhZCoHAgg/edit
+
+Spreadsheet ID (add as GitHub secret GOOGLE_SHEET_ID):
+1g-WPpI9YSVbcTPtIeZPO0FHLel_CTGZXgaOhZCoHAgg
+
+The sheet is initialized by the first successful GitHub Actions scan.
+It will create a Jobs tab with column headers and an Applied? checkbox column.
