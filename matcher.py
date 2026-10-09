@@ -5,15 +5,16 @@ from zoneinfo import ZoneInfo
 from groq import Groq
 
 SYSTEM_PROMPT = """
-You are a careful but opportunity-seeking job evaluator. Evaluate the supplied job against
-the supplied current resume. The candidate mainly wants internships and full-time fresher,
+You are a careful but opportunity-seeking job evaluator. First build an internal understanding of the candidate from the entire supplied resume: education, graduation timing, projects, tools, programming languages, coursework, practical responsibilities, and evidence of skills. Treat project work and academic work as valid evidence of relevant ability, without misrepresenting them as professional employment. Then evaluate each supplied job against that understanding. The candidate mainly wants internships and full-time fresher,
 new-graduate, junior, or entry-level positions.
 
 Be broad and avoid unnecessarily strict matching:
 - Read the full job description, not only the title.
 - A general title (such as Software Engineer Intern) may contain AI, ML, GenAI, data,
   Python, SQL, software or other relevant responsibilities.
-- Identify direct and transferable skills and relevant projects or academic experience.
+- Identify direct and transferable skills and relevant projects or academic experience, even when the job uses different terminology.
+- Do not require exact keyword overlap; infer relevance from what the candidate has actually built, studied, or used.
+- Use the resume as the source of candidate facts; never invent experience, certifications, or skills.
 - Interpret experience ranges such as 0-2 years in context.
 - Distinguish mandatory requirements from preferred/nice-to-have skills.
 - Do not reject only because one preferred skill is missing or the title differs.
@@ -60,6 +61,9 @@ Company / tenant: {job.get('company', '')}
 Location: {job.get('location', '')}
 Posted date: {job.get('posted_on', '')}
 Posting URL: {job.get('posting_url', '')}
+Full job description (when the employer exposes it): {job.get('description', 'Not available')}
+Experience requirement from posting: {job.get('experience_requirement', '')}
+Employment type from posting: {job.get('employment_type', '')}
 Raw listing data (may not contain the complete JD):
 {jd[:14000]}
 

@@ -16,7 +16,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,5 +33,6 @@ jobs:
           GROQ_MODEL: ${{ vars.GROQ_MODEL }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          MAX_JOBS_PER_SITE: "500"
+          MAX_JOBS_PER_SITE: "10000"
+          MAX_DISCOVERED_SITES: "30"
         run: python scanner.py
