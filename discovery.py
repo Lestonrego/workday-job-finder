@@ -126,7 +126,11 @@ def _career_root(url):
 
 # --------------------------------------------------------------------------- sources
 
+# host -> company name, learned from the public listing datasets (used for clean company names)
+COMPANY_NAMES = {}
+
 LISTING_SOURCES = [
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
     "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
 ]
@@ -143,6 +147,10 @@ def _discover_github_listings(found, hosts, max_sites):
             before = len(found)
             for item in response.json():
                 _add_candidate(item.get("url", ""), found, hosts)
+                host = _host_of(_unwrap(item.get("url", "")))
+                name = (item.get("company_name") or "").strip()
+                if host and name:
+                    COMPANY_NAMES.setdefault(host, name)
             print(f"Listings {url.split('/')[4]}: {len(found) - before} new site(s).")
         except Exception as exc:
             print(f"Listings {url} failed: {exc}")

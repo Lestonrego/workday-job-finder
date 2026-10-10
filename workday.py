@@ -168,7 +168,9 @@ def fetch_job_detail(cfg, external_path, session):
             info = data.get("jobPostingInfo") or data
             description_html = info.get("jobDescription") or info.get("jobDescriptionHtml") or ""
             description = BeautifulSoup(description_html, "html.parser").get_text(" ", strip=True) if description_html else ""
+            org = data.get("hiringOrganization") or info.get("hiringOrganization") or {}
             return {
+                "company": (org.get("name") if isinstance(org, dict) else "") or "",
                 "description": description,
                 "detail_title": info.get("title") or info.get("jobTitle") or "",
                 "detail_location": info.get("location") or info.get("locationName") or "",
@@ -189,6 +191,7 @@ def enrich_workday_job(job):
         session = requests.Session()
         detail = fetch_job_detail(cfg, job.get("posting_url", ""), session)
         if detail:
+            job["company"] = job.get("company_known") or detail.get("company") or job.get("company", "")
             job["title"] = detail.get("detail_title") or job.get("title", "")
             job["location"] = detail.get("detail_location") or job.get("location", "")
             job["employment_type"] = detail.get("employment_type") or job.get("employment_type", "")
@@ -236,7 +239,9 @@ def fetch_workday_jobs(career_url, max_jobs=10000, search_text=""):
                 external_path = urlparse(path).path
             else:
                 external_path = path
-                posting_url = cfg["base"] + (path if path.startswith("/") else "/" + path)
+                rel = path if path.startswith("/") else "/" + path
+                # Public job pages live under /<locale>/<site>/job/...; omitting that gives a dead link.
+                posting_url = f"{cfg['base']}/{cfg['locale']}/{cfg['site']}{rel}"
             locations = item.get("locationsText") or item.get("location") or ""
             title = item.get("title") or item.get("jobTitle") or ""
             bullets = item.get("bulletFields") or []
@@ -292,3 +297,8 @@ def confirm_sites(urls, workers=24):
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return [u for u in pool.map(check, unique.values()) if u]
+
+
+def pretty_company(tenant):
+    """Last-resort readable company name from a Workday tenant id."""
+    return re.sub(r"[-_]+", " ", tenant or "").strip().title()

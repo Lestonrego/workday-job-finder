@@ -1,13 +1,14 @@
 import os
 import re
 import time
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
-from sheets import get_spreadsheet, ensure_tabs, upsert_job, cleanup_expired_jobs, read_jobs
-from workday import confirm_sites, discover_workday_sites, enrich_workday_job, fetch_workday_jobs
-from discovery import discover_workday_sites_from_search
-from matcher import evaluate_job, now_ist
+from sheets import get_spreadsheet, ensure_tabs, cleanup_expired_jobs, read_jobs, save_jobs, compact_blank_rows, remove_duplicate_rows, job_key
+from workday import pretty_company, confirm_sites, discover_workday_sites, enrich_workday_job, fetch_workday_jobs
+from discovery import discover_workday_sites_from_search, COMPANY_NAMES
+from matcher import evaluate_job, now_ist, rule_based_evaluate, QuotaExhausted
 from pypdf import PdfReader
 
 load_dotenv()
@@ -123,9 +124,9 @@ def main():
     start = time.time()
     budget = float(os.environ.get("RUN_BUDGET_MIN", "270")) * 60   # stay under the 6h Actions limit
     fetch_budget = budget * 0.45
-    max_llm = int(os.environ.get("MAX_LLM_CALLS", "300"))
+    max_llm = int(os.environ.get("MAX_LLM_CALLS", "5000"))
     llm_delay = float(os.environ.get("LLM_DELAY_SEC", "2"))
-    terms = [t.strip() for t in os.environ.get("SEARCH_TERMS", "intern,graduate,trainee").split(",") if t.strip()]
+    terms = [t.strip() for t in os.environ.get("SEARCH_TERMS", "intern,graduate,trainee,2027").split(",") if t.strip()]
     elapsed = lambda: time.time() - start
 
     resume = read_resume_pdf()
@@ -147,8 +148,10 @@ def main():
     spreadsheet = get_spreadsheet()
     ensure_tabs(spreadsheet)
     cleanup_expired_jobs(spreadsheet, max_age_days=3)
-    _, _, url_to_row = read_jobs(spreadsheet)
-    existing = set(url_to_row)
+    remove_duplicate_rows(spreadsheet)
+    compact_blank_rows(spreadsheet)
+    _, sheet_rows, _ = read_jobs(spreadsheet)
+    existing = {job_key(r.get("Application URL", "")) for r in sheet_rows}
     errors = []
 
     # Phase 1: fetch only intern/graduate/trainee listings, in parallel, keep India-ish ones.
@@ -162,6 +165,10 @@ def main():
                 if url in seen:
                     continue
                 seen.add(url)
+                host = urlparse(site).netloc.lower()
+                known = COMPANY_NAMES.get(host)
+                job["company_known"] = known
+                job["company"] = known or pretty_company(job.get("company", ""))
                 loc = job.get("location", "")
                 if is_clearly_outside_india(loc) or not maybe_india(loc) or not not_senior(job.get("title", "")):
                     continue
@@ -184,45 +191,75 @@ def main():
                 for f in futures:
                     f.cancel()
                 break
-    pending = [j for j in pending if (j.get("posting_url") or "").rstrip("/") not in existing]
+    uniq = {}
+    for j in pending:
+        k = job_key(j.get("posting_url", ""))
+        if k and k not in existing:
+            uniq.setdefault(k, j)
+    pending = list(uniq.values())
     # Internships first, so the LLM budget goes to the best matches.
-    pending.sort(key=lambda j: 0 if "intern" in j.get("title", "").lower() else 1)
+    pending.sort(key=lambda j: 0 if ("intern" in j.get("title", "").lower() or "2027" in j.get("title", "")) else 1)
     print(f"{len(pending)} new India-candidate job(s) to evaluate ({elapsed()/60:.1f} min elapsed).")
 
     # Phase 2: enrich, confirm India from full details, then evaluate with the LLM.
     llm_calls = saved = 0
-    for job in pending:
-        if elapsed() > budget or llm_calls >= max_llm:
-            print(f"Stopping evaluation (elapsed {elapsed()/60:.0f} min, LLM calls {llm_calls}).")
-            break
-        try:
-            job = enrich_workday_job(job)
-            detail = (job.get("raw") or {}).get("detail") or {}
-            extra = " ".join(map(str, detail.get("additionalLocations") or []))
-            location = job.get("location", "")
-            if not definitely_india(f"{location} {extra}"):
-                continue  # not verifiably in India: no LLM tokens spent
-            llm_calls += 1
-            result = evaluate_job(resume, job)
-            time.sleep(llm_delay)
-            if not result.get("is_relevant", False):
-                continue
-            record = {
-                "Company Name": job.get("company", ""),
-                "Job Title": job.get("title", ""),
-                "Location": location,
-                "Employment Type": result.get("employment_type", job.get("employment_type", "")),
-                "Eligibility Concerns": "; ".join(map(str, result.get("eligibility_concerns", []))),
-                "Application URL": job.get("application_url") or job.get("posting_url") or "",
-                "Discovered At": now_ist(),
-                "Career Site URL": job.get("career_site", ""),
-                "Applied?": False,
-            }
-            print(f"{upsert_job(spreadsheet, record)}: {record['Job Title']} | {location}")
-            saved += 1
-        except Exception as exc:
-            errors.append(f"{job.get('posting_url')}: {exc}")
-            print(f"Evaluation failed for {job.get('posting_url')}: {exc}")
+    stats = {"not_india": 0, "rule_reject": 0, "llm_reject": 0}
+    batch = []
+    deadline = start + budget
+
+    def flush():
+        nonlocal saved
+        if batch:
+            added, updated = save_jobs(spreadsheet, batch)
+            saved += added + updated
+            print(f"Sheet: wrote {added} new / {updated} updated row(s).")
+            batch.clear()
+
+    try:
+        for job in pending:
+            if time.time() > deadline or llm_calls >= max_llm:
+                print(f"Stopping evaluation (elapsed {elapsed()/60:.0f} min, LLM calls {llm_calls}).")
+                break
+            try:
+                job = enrich_workday_job(job)
+                detail = (job.get("raw") or {}).get("detail") or {}
+                extra = " ".join(map(str, detail.get("additionalLocations") or []))
+                location = job.get("location", "")
+                if not definitely_india(f"{location} {extra}"):
+                    stats["not_india"] += 1
+                    continue  # not verifiably in India
+                if not rule_based_evaluate(job)["is_relevant"]:
+                    stats["rule_reject"] += 1
+                    continue  # wrong field or mandatory experience: no tokens spent
+                llm_calls += 1
+                result = evaluate_job(resume, job, deadline=deadline)   # waits as long as Groq says
+                time.sleep(llm_delay)
+                if not result.get("is_relevant", False):
+                    stats["llm_reject"] += 1
+                    continue
+                batch.append({
+                    "Company Name": job.get("company", ""),
+                    "Job Title": job.get("title", ""),
+                    "Location": location,
+                    "Employment Type": result.get("employment_type") or job.get("employment_type", ""),
+                    "Eligibility Concerns": "; ".join(map(str, result.get("eligibility_concerns", []))),
+                    "Application URL": job.get("application_url") or job.get("posting_url") or "",
+                    "Discovered At": now_ist(),
+                    "Career Site URL": job.get("career_site", ""),
+                    "Applied?": False,
+                })
+                print(f"Match: {job.get('company')} | {job.get('title')} | {location}")
+                if len(batch) >= 5:
+                    flush()
+            except QuotaExhausted as exc:
+                print(f"{exc} Saving progress; the rest will be evaluated on the next run.")
+                break
+            except Exception as exc:
+                errors.append(f"{job.get('posting_url')}: {exc}")
+                print(f"Failed for {job.get('posting_url')}: {exc}")
+    finally:
+        flush()   # never lose matches already found
+    print(f"Outcome counts: {stats}")
 
     cleanup_expired_jobs(spreadsheet, max_age_days=3)
     print(f"Finished in {elapsed()/60:.1f} min. Saved {saved}; LLM calls {llm_calls}; errors {len(errors)}.")
