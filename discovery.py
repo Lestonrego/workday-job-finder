@@ -126,6 +126,28 @@ def _career_root(url):
 
 # --------------------------------------------------------------------------- sources
 
+LISTING_SOURCES = [
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
+    "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+]
+
+
+def _discover_github_listings(found, hosts, max_sites):
+    """Harvest Workday URLs from public internship listing datasets (reliable from Actions)."""
+    for url in LISTING_SOURCES:
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=90)
+            if response.status_code != 200:
+                print(f"Listings {url.split('/')[4]}: HTTP {response.status_code}")
+                continue
+            before = len(found)
+            for item in response.json():
+                _add_candidate(item.get("url", ""), found, hosts)
+            print(f"Listings {url.split('/')[4]}: {len(found) - before} new site(s).")
+        except Exception as exc:
+            print(f"Listings {url} failed: {exc}")
+
+
 def _discover_common_crawl(found, hosts, max_sites):
     """Read myworkdayjobs.com URLs from the latest Common Crawl indexes."""
     crawls = _env_int("CC_CRAWLS", 2)
@@ -223,6 +245,7 @@ def _discover_search_engines(found, hosts, max_sites):
     ]
     for provider_name, endpoint, query_param, page_param, page_step, page_start in providers:
         provider_blocked = False
+        empty_pages = 0
         for qi, query in enumerate(QUERIES, start=1):
             if len(found) >= max_sites or provider_blocked:
                 break
@@ -244,6 +267,11 @@ def _discover_search_engines(found, hosts, max_sites):
                     for href in _extract_links(soup, provider_name):
                         _add_candidate(href, found, hosts)
                     print(f"Search {provider_name}: query {qi}/{len(QUERIES)}, page {page + 1}, {len(found) - before} new site(s).")
+                    empty_pages = 0 if len(found) > before else empty_pages + 1
+                    if empty_pages >= 6:
+                        print(f"{provider_name} returns nothing; skipping it.")
+                        provider_blocked = True
+                        break
                     if len(found) == before and page > 0:
                         break
                 except Exception as exc:
@@ -304,6 +332,7 @@ def discover_workday_sites_from_search(max_sites=5000):
     hosts = set()
 
     for name, source in (
+        ("GitHub listings", _discover_github_listings),
         ("Common Crawl", _discover_common_crawl),
         ("Internet Archive", _discover_wayback),
         ("Search engines", _discover_search_engines),

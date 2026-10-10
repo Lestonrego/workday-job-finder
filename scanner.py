@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from sheets import get_spreadsheet, ensure_tabs, upsert_job, cleanup_expired_jobs
@@ -62,6 +63,35 @@ def is_clearly_outside_india(location):
         return False
     return any(marker in text for marker in foreign_markers)
 
+INDIA_HINTS = [
+    "india", "bengaluru", "bangalore", "hyderabad", "pune", "chennai", "mumbai", "navi mumbai",
+    "gurgaon", "gurugram", "noida", "delhi", "kolkata", "ahmedabad", "mangalore", "mysore",
+    "kochi", "coimbatore", "jaipur", "chandigarh", "indore", "trivandrum", "thiruvananthapuram",
+    "nagpur", "bhubaneswar", "vadodara", "visakhapatnam", "lucknow", "karnataka", "maharashtra",
+    "telangana", "tamil nadu", "haryana", "uttar pradesh", "kerala", "gujarat", "west bengal",
+]
+ENTRY_HINTS = [
+    "intern", "trainee", "graduate", "fresher", "entry", "junior", "apprentice", "campus",
+    "early career", "early talent", "university", "student", "associate", "analyst", "engineer i",
+    "engineer 1", "developer i", "new grad", "co-op", "coop", "rotational",
+]
+SENIOR_HINTS = ["senior", "sr.", "sr ", "staff", "principal", "lead", "manager", "director", "head of", "vp ", "architect"]
+
+
+def maybe_india(location):
+    t = (location or "").lower().strip()
+    if not t or "remote" in t or re.search(r"\d+\s+locations?", t):
+        return True
+    return any(h in t for h in INDIA_HINTS)
+
+
+def maybe_entry_level(title):
+    t = (title or "").lower()
+    if any(h in t for h in SENIOR_HINTS) and "intern" not in t:
+        return False
+    return any(h in t for h in ENTRY_HINTS)
+
+
 def main():
     # Store editable, non-secret configuration in repository files.
     resume = read_resume_pdf()
@@ -102,6 +132,8 @@ def main():
                 location = job.get("location", "")
                 if is_clearly_outside_india(location):
                     print(f"Skipping clearly non-India location: {job.get('title')} | {location}")
+                    continue
+                if not maybe_india(location) or not maybe_entry_level(job.get("title", "")):
                     continue
                 try:
                     # Enrich India-like and ambiguous city/state-only listings. The LLM decides
