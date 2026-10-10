@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from sheets import get_spreadsheet, ensure_tabs, upsert_job
+from sheets import get_spreadsheet, ensure_tabs, upsert_job, cleanup_expired_jobs
 from workday import discover_workday_sites, enrich_workday_job, fetch_workday_jobs
 from discovery import discover_workday_sites_from_search
 from matcher import evaluate_job, now_ist
@@ -36,17 +36,31 @@ def read_resume_pdf():
     print(f"Resume loaded from resume.pdf ({len(resume_text)} characters).")
     return resume_text
 
-def is_india_location(location):
-    text = (location or "").lower()
-    india_markers = [
-        "india", "bengaluru", "bangalore", "mangaluru", "mangalore", "hyderabad",
-        "chennai", "pune", "mumbai", "new delhi", "delhi", "gurugram", "gurgaon",
-        "noida", "kolkata", "kochi", "cochin", "coimbatore", "ahmedabad", "jaipur",
-        "indore", "bhubaneswar", "thiruvananthapuram", "trivandrum", "mysuru", "mysore",
-        "nagpur", "lucknow", "chandigarh", "visakhapatnam", "vizag", "vadodara",
-        "surat", "tiruchirappalli", "trichy", "remote - india", "india remote"
+def is_clearly_outside_india(location):
+    """Fast reject only locations explicitly identified as outside India.
+
+    City/state-only and ambiguous locations are passed to the LLM after enrichment,
+    so Indian states/cities do not get discarded just because the word India is absent.
+    """
+    text = (location or "").lower().strip()
+    if not text:
+        return False
+    foreign_markers = [
+        "united states", "u.s.a.", "usa", "united kingdom", "uk", "canada", "mexico",
+        "brazil", "argentina", "colombia", "chile", "peru", "ecuador", "ireland",
+        "germany", "france", "spain", "italy", "portugal", "netherlands", "belgium",
+        "switzerland", "austria", "poland", "czech republic", "czechia", "hungary",
+        "romania", "bulgaria", "greece", "sweden", "norway", "denmark", "finland",
+        "australia", "new zealand", "singapore", "malaysia", "indonesia", "thailand",
+        "vietnam", "philippines", "china", "japan", "south korea", "korea", "taiwan",
+        "hong kong", "israel", "saudi arabia", "united arab emirates", "uae", "qatar",
+        "south africa", "egypt", "kenya", "nigeria", "morocco", "turkey", "türkiye",
+        "remote - us", "remote - usa", "remote - canada", "remote - uk", "remote - europe",
     ]
-    return any(marker in text for marker in india_markers)
+    # An explicit India mention overrides generic words that could occur in an address.
+    if "india" in text or "indian" in text:
+        return False
+    return any(marker in text for marker in foreign_markers)
 
 def main():
     # Store editable, non-secret configuration in repository files.
@@ -75,6 +89,7 @@ def main():
 
     spreadsheet = get_spreadsheet()
     ensure_tabs(spreadsheet)
+    cleanup_expired_jobs(spreadsheet, max_age_days=3)
     errors = []
     total = 0
 
@@ -85,11 +100,12 @@ def main():
             for job in jobs:
                 total += 1
                 location = job.get("location", "")
-                if not is_india_location(location):
-                    print(f"Skipping non-India/unknown location: {job.get('title')} | {location}")
+                if is_clearly_outside_india(location):
+                    print(f"Skipping clearly non-India location: {job.get('title')} | {location}")
                     continue
                 try:
-                    # Full descriptions are fetched only for jobs whose listing location looks Indian.
+                    # Enrich India-like and ambiguous city/state-only listings. The LLM decides
+                    # whether the final location is in India and whether experience is required.
                     job = enrich_workday_job(job)
                     location = job.get("location", location)
                     result = evaluate_job(resume, job)
@@ -117,6 +133,9 @@ def main():
             print(f"Site scan failed: {site}: {exc}")
             errors.append(f"{site}: {exc}")
 
+    # Run expiry cleanup again after upserts. Existing jobs retain their first-seen timestamp,
+    # so updating a duplicate never extends its 3-day lifetime.
+    cleanup_expired_jobs(spreadsheet, max_age_days=3)
     print(f"Finished. Processed {total} listings; errors: {len(errors)}")
     if errors:
         print("\n".join(errors[:30]))

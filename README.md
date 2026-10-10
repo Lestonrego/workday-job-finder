@@ -61,3 +61,15 @@ Enable Actions and run **Scheduled Workday Job Scan → Run workflow** once to t
 
 ### Automatic discovery fallback
 The scanner searches public search engines first. If they block automated requests or return no usable results, it tries a small built-in set of public Workday career-site seed URLs and validates each against the site's public jobs API. This improves resilience but is not a complete directory of all Workday employers. `career_sites.txt` remains optional and can be left empty.
+
+## Expanded discovery, eligibility filtering, and automatic expiry
+
+- Discovery now queries DuckDuckGo and Bing across multiple pages for a wider set of Workday career sites, and merges seed URLs even when search returns some results. Search engines can block automated requests, so this is broader best-effort discovery, not a complete global directory of every Workday employer.
+- `MAX_DISCOVERED_SITES` is a ceiling, not a guarantee. The actual number found depends on the public search results. `DISCOVERY_PAGES_PER_QUERY` controls pages queried per search query.
+- Pagination continues when Workday returns listings even if a later page incorrectly reports `total: 0`. `MAX_JOBS_PER_SITE` remains a safety cap.
+- Jobs explicitly located outside India are skipped early. City/state-only or ambiguous locations are enriched and sent to the evaluator, which must confirm India eligibility from the available fields before a job is saved.
+- The evaluator rejects roles requiring mandatory prior professional experience and focuses on internships and full-time entry-level roles relevant to the resume. Projects are not treated as professional work experience.
+- Rows in the `Jobs` tab are automatically deleted once their original `Discovered At` timestamp is at least 3 days old. Updating a duplicate listing preserves its original timestamp, so rescans do not restart the 3-day timer. Rows with missing or unparseable timestamps are preserved for safety.
+- Groq requests retry rate-limit errors. The free API tier still has token/request limits; large scans may take longer or encounter rate limits. Increase coverage gradually if GitHub Actions runtime is exceeded.
+
+A separate hourly GitHub Actions workflow (`cleanup.yml`) checks the sheet for expiry, so old rows are removed within roughly one hour after reaching 72 hours of age even between the three scheduled scans. GitHub scheduled workflows can be delayed occasionally, so this is not a second-precise timer.
