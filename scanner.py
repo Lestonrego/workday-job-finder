@@ -1,9 +1,11 @@
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
-from sheets import get_spreadsheet, ensure_tabs, upsert_job, cleanup_expired_jobs
-from workday import discover_workday_sites, enrich_workday_job, fetch_workday_jobs
+from sheets import get_spreadsheet, ensure_tabs, upsert_job, cleanup_expired_jobs, read_jobs
+from workday import confirm_sites, discover_workday_sites, enrich_workday_job, fetch_workday_jobs
 from discovery import discover_workday_sites_from_search
 from matcher import evaluate_job, now_ist
 from pypdf import PdfReader
@@ -63,116 +65,170 @@ def is_clearly_outside_india(location):
         return False
     return any(marker in text for marker in foreign_markers)
 
-INDIA_HINTS = [
+def is_clearly_outside_india(location):
+    """Fast reject only locations explicitly identified as outside India.
+
+    City/state-only and ambiguous locations are passed to the LLM after enrichment,
+    so Indian states/cities do not get discarded just because the word India is absent.
+    """
+    text = (location or "").lower().strip()
+    if not text:
+        return False
+    foreign_markers = [
+        "united states", "u.s.a.", "usa", "united kingdom", "uk", "canada", "mexico",
+        "brazil", "argentina", "colombia", "chile", "peru", "ecuador", "ireland",
+        "germany", "france", "spain", "italy", "portugal", "netherlands", "belgium",
+        "switzerland", "austria", "poland", "czech republic", "czechia", "hungary",
+        "romania", "bulgaria", "greece", "sweden", "norway", "denmark", "finland",
+        "australia", "new zealand", "singapore", "malaysia", "indonesia", "thailand",
+        "vietnam", "philippines", "china", "japan", "south korea", "korea", "taiwan",
+        "hong kong", "israel", "saudi arabia", "united arab emirates", "uae", "qatar",
+        "south africa", "egypt", "kenya", "nigeria", "morocco", "turkey", "türkiye",
+        "remote - us", "remote - usa", "remote - canada", "remote - uk", "remote - europe",
+    ]
+    # An explicit India mention overrides generic words that could occur in an address.
+    if "india" in text or "indian" in text:
+        return False
+    return any(marker in text for marker in foreign_markers)
+
+
+INDIA_WORDS = [
     "india", "bengaluru", "bangalore", "hyderabad", "pune", "chennai", "mumbai", "navi mumbai",
-    "gurgaon", "gurugram", "noida", "delhi", "kolkata", "ahmedabad", "mangalore", "mysore",
-    "kochi", "coimbatore", "jaipur", "chandigarh", "indore", "trivandrum", "thiruvananthapuram",
-    "nagpur", "bhubaneswar", "vadodara", "visakhapatnam", "lucknow", "karnataka", "maharashtra",
-    "telangana", "tamil nadu", "haryana", "uttar pradesh", "kerala", "gujarat", "west bengal",
+    "gurgaon", "gurugram", "noida", "greater noida", "delhi", "new delhi", "kolkata", "ahmedabad",
+    "mangalore", "mangaluru", "mysore", "mysuru", "kochi", "cochin", "coimbatore", "jaipur", "chandigarh",
+    "indore", "trivandrum", "thiruvananthapuram", "nagpur", "bhubaneswar", "vadodara", "visakhapatnam",
+    "lucknow", "surat", "bhopal", "patna", "mohali", "faridabad", "ghaziabad", "thane", "karnataka",
+    "maharashtra", "telangana", "tamil nadu", "haryana", "uttar pradesh", "kerala", "gujarat",
+    "west bengal", "andhra pradesh", "odisha", "rajasthan", "madhya pradesh", "punjab",
 ]
-ENTRY_HINTS = [
-    "intern", "trainee", "graduate", "fresher", "entry", "junior", "apprentice", "campus",
-    "early career", "early talent", "university", "student", "associate", "analyst", "engineer i",
-    "engineer 1", "developer i", "new grad", "co-op", "coop", "rotational",
-]
-SENIOR_HINTS = ["senior", "sr.", "sr ", "staff", "principal", "lead", "manager", "director", "head of", "vp ", "architect"]
+INDIA_RE = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in INDIA_WORDS) + r")\b", re.I)
+SENIOR_RE = re.compile(r"\b(senior|sr\.?|staff|principal|lead|manager|director|head of|vp|vice president|architect|specialist iii?|iv)\b", re.I)
+
+
+def definitely_india(text):
+    return bool(INDIA_RE.search(text or ""))
 
 
 def maybe_india(location):
-    t = (location or "").lower().strip()
-    if not t or "remote" in t or re.search(r"\d+\s+locations?", t):
-        return True
-    return any(h in t for h in INDIA_HINTS)
+    """Cheap listing-level check: India text, or an ambiguous multi-location/remote listing."""
+    t = (location or "").strip()
+    return (not t) or definitely_india(t) or bool(re.search(r"\d+\s+locations?|\bremote\b", t, re.I))
 
 
-def maybe_entry_level(title):
-    t = (title or "").lower()
-    if any(h in t for h in SENIOR_HINTS) and "intern" not in t:
-        return False
-    return any(h in t for h in ENTRY_HINTS)
+def not_senior(title):
+    return "intern" in (title or "").lower() or not SENIOR_RE.search(title or "")
 
 
 def main():
-    # Store editable, non-secret configuration in repository files.
+    start = time.time()
+    budget = float(os.environ.get("RUN_BUDGET_MIN", "270")) * 60   # stay under the 6h Actions limit
+    fetch_budget = budget * 0.45
+    max_llm = int(os.environ.get("MAX_LLM_CALLS", "300"))
+    llm_delay = float(os.environ.get("LLM_DELAY_SEC", "2"))
+    terms = [t.strip() for t in os.environ.get("SEARCH_TERMS", "intern,graduate,trainee").split(",") if t.strip()]
+    elapsed = lambda: time.time() - start
+
     resume = read_resume_pdf()
-    sites = [
-        line.strip() for line in read_config_text("career_sites.txt").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    manual = [l.strip() for l in read_config_text("career_sites.txt").splitlines()
+              if l.strip() and not l.strip().startswith("#")]
+    discovered = discover_workday_sites_from_search(max_sites=int(os.environ.get("MAX_DISCOVERED_SITES", "5000")))
+    candidates = list(dict.fromkeys(manual + discovered))
+    if not candidates:
+        raise RuntimeError("Discovery returned no candidate sites.")
 
-    # Automatically search public web indexes for Workday employers. Manual seed URLs
-    # remain optional and are merged with search-discovered candidates.
-    max_discovered = int(os.environ.get("MAX_DISCOVERED_SITES", "5000"))
-    discovered = discover_workday_sites_from_search(max_sites=max_discovered)
-    seed_sites = list(dict.fromkeys(sites + discovered))
-    if not seed_sites:
-        raise RuntimeError(
-            "Automatic discovery and fallback seeds returned no candidates. "
-            "Check public search access in the Actions logs and retry the workflow."
-        )
-
-    # Confirm candidates against Workday's public jobs API and probe related career paths.
-    sites = discover_workday_sites(seed_sites)
+    # Fast parallel validation (optionally probe extra site names with PROBE_SITES=1).
+    sites = confirm_sites(candidates)
+    if os.environ.get("PROBE_SITES") == "1":
+        sites = discover_workday_sites(sites)
+    print(f"{len(sites)} confirmed Workday site(s) of {len(candidates)} candidates ({elapsed()/60:.1f} min).")
     if not sites:
-        raise RuntimeError("No working public Workday career sites were found. Check career_sites.txt.")
-    print(f"Scanning {len(sites)} confirmed Workday career site(s).")
+        raise RuntimeError("No working public Workday career sites were found.")
 
     spreadsheet = get_spreadsheet()
     ensure_tabs(spreadsheet)
     cleanup_expired_jobs(spreadsheet, max_age_days=3)
+    _, _, url_to_row = read_jobs(spreadsheet)
+    existing = set(url_to_row)
     errors = []
-    total = 0
 
-    for site in sites:
+    # Phase 1: fetch only intern/graduate/trainee listings, in parallel, keep India-ish ones.
+    cap = int(os.environ.get("MAX_JOBS_PER_SITE", "300"))
+
+    def scan_site(site):
+        found, seen = [], set()
+        for term in terms:
+            for job in fetch_workday_jobs(site, max_jobs=cap, search_text=term):
+                url = job.get("posting_url", "")
+                if url in seen:
+                    continue
+                seen.add(url)
+                loc = job.get("location", "")
+                if is_clearly_outside_india(loc) or not maybe_india(loc) or not not_senior(job.get("title", "")):
+                    continue
+                found.append(job)
+        return found
+
+    pending, done = [], 0
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("FETCH_WORKERS", "12"))) as pool:
+        futures = {pool.submit(scan_site, s): s for s in sites}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                pending.extend(fut.result())
+            except Exception as exc:
+                errors.append(f"{futures[fut]}: {exc}")
+            if done % 50 == 0:
+                print(f"Fetched {done}/{len(sites)} sites; {len(pending)} India-candidate jobs; {elapsed()/60:.1f} min.")
+            if elapsed() > fetch_budget:
+                print("Fetch time budget reached; continuing with what was collected.")
+                for f in futures:
+                    f.cancel()
+                break
+    pending = [j for j in pending if (j.get("posting_url") or "").rstrip("/") not in existing]
+    # Internships first, so the LLM budget goes to the best matches.
+    pending.sort(key=lambda j: 0 if "intern" in j.get("title", "").lower() else 1)
+    print(f"{len(pending)} new India-candidate job(s) to evaluate ({elapsed()/60:.1f} min elapsed).")
+
+    # Phase 2: enrich, confirm India from full details, then evaluate with the LLM.
+    llm_calls = saved = 0
+    for job in pending:
+        if elapsed() > budget or llm_calls >= max_llm:
+            print(f"Stopping evaluation (elapsed {elapsed()/60:.0f} min, LLM calls {llm_calls}).")
+            break
         try:
-            jobs = fetch_workday_jobs(site, max_jobs=int(os.environ.get("MAX_JOBS_PER_SITE", "100000")))
-            print(f"{site}: collected {len(jobs)} listings")
-            for job in jobs:
-                total += 1
-                location = job.get("location", "")
-                if is_clearly_outside_india(location):
-                    print(f"Skipping clearly non-India location: {job.get('title')} | {location}")
-                    continue
-                if not maybe_india(location) or not maybe_entry_level(job.get("title", "")):
-                    continue
-                try:
-                    # Enrich India-like and ambiguous city/state-only listings. The LLM decides
-                    # whether the final location is in India and whether experience is required.
-                    job = enrich_workday_job(job)
-                    location = job.get("location", location)
-                    result = evaluate_job(resume, job)
-                    # No rigid match-score threshold. Keep plausible opportunities for review.
-                    if not result.get("is_relevant", True):
-                        continue
-                    url = job.get("posting_url") or job.get("application_url") or ""
-                    record = {
-                        "Company Name": job.get("company", ""),
-                        "Job Title": job.get("title", ""),
-                        "Location": location,
-                        "Employment Type": result.get("employment_type", job.get("employment_type", "")),
-                        "Eligibility Concerns": "; ".join(map(str, result.get("eligibility_concerns", []))),
-                        "Application URL": job.get("application_url") or job.get("posting_url") or "",
-                        "Discovered At": now_ist(),
-                        "Career Site URL": job.get("career_site", ""),
-                        "Applied?": False,
-                    }
-                    action = upsert_job(spreadsheet, record)
-                    print(f"{action}: {record['Job Title']} | {location} | {record['Employment Type']}")
-                except Exception as exc:
-                    print(f"Evaluation failed for {job.get('posting_url')}: {exc}")
-                    errors.append(f"{job.get('posting_url')}: {exc}")
+            job = enrich_workday_job(job)
+            detail = (job.get("raw") or {}).get("detail") or {}
+            extra = " ".join(map(str, detail.get("additionalLocations") or []))
+            location = job.get("location", "")
+            if not definitely_india(f"{location} {extra}"):
+                continue  # not verifiably in India: no LLM tokens spent
+            llm_calls += 1
+            result = evaluate_job(resume, job)
+            time.sleep(llm_delay)
+            if not result.get("is_relevant", False):
+                continue
+            record = {
+                "Company Name": job.get("company", ""),
+                "Job Title": job.get("title", ""),
+                "Location": location,
+                "Employment Type": result.get("employment_type", job.get("employment_type", "")),
+                "Eligibility Concerns": "; ".join(map(str, result.get("eligibility_concerns", []))),
+                "Application URL": job.get("application_url") or job.get("posting_url") or "",
+                "Discovered At": now_ist(),
+                "Career Site URL": job.get("career_site", ""),
+                "Applied?": False,
+            }
+            print(f"{upsert_job(spreadsheet, record)}: {record['Job Title']} | {location}")
+            saved += 1
         except Exception as exc:
-            print(f"Site scan failed: {site}: {exc}")
-            errors.append(f"{site}: {exc}")
+            errors.append(f"{job.get('posting_url')}: {exc}")
+            print(f"Evaluation failed for {job.get('posting_url')}: {exc}")
 
-    # Run expiry cleanup again after upserts. Existing jobs retain their first-seen timestamp,
-    # so updating a duplicate never extends its 3-day lifetime.
     cleanup_expired_jobs(spreadsheet, max_age_days=3)
-    print(f"Finished. Processed {total} listings; errors: {len(errors)}")
+    print(f"Finished in {elapsed()/60:.1f} min. Saved {saved}; LLM calls {llm_calls}; errors {len(errors)}.")
     if errors:
-        print("\n".join(errors[:30]))
-    if total == 0 and errors:
-        raise RuntimeError("The scan could not process any listings. Check the logs and career site URLs.")
+        print("\n".join(errors[:20]))
+
 
 if __name__ == "__main__":
     main()

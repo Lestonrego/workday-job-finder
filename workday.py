@@ -1,4 +1,5 @@
 """Workday career-site discovery and exhaustive public listing pagination."""
+import os
 import re
 import time
 from urllib.parse import urlparse, urljoin
@@ -20,7 +21,8 @@ COMMON_SITE_NAMES = [
     "Careers", "Jobs", "Campus", "Internships", "Students", "University_Recruiting",
     "Early_Career", "Early_Careers", "External_Global", "External_US", "Internal",
 ]
-COMMON_LOCALES = ["en-US", "en-IN", "en-GB", "en-CA"]
+# The jobs API URL does not contain the locale, so locale variants are duplicates; probe one.
+COMMON_LOCALES = ["en-US"]
 
 
 def normalize_url(url):
@@ -91,7 +93,7 @@ def discover_workday_sites(seed_urls):
         except ValueError as exc:
             print(f"Ignoring invalid Workday URL {url}: {exc}")
             continue
-        key = (cfg["base"].lower(), cfg["locale"].lower(), cfg["site"].lower())
+        key = (cfg["base"].lower(), "", cfg["site"].lower())
         if key in visited:
             continue
         visited.add(key)
@@ -126,7 +128,7 @@ def discover_workday_sites(seed_urls):
             continue
         for locale in COMMON_LOCALES:
             for site_name in COMMON_SITE_NAMES:
-                candidate_key = (cfg["base"].lower(), locale.lower(), site_name.lower())
+                candidate_key = (cfg["base"].lower(), "", site_name.lower())
                 if candidate_key in discovered:
                     continue
                 candidate_url = f"{cfg['base']}/{locale}/{site_name}"
@@ -199,7 +201,7 @@ def enrich_workday_job(job):
         return job
 
 
-def fetch_workday_jobs(career_url, max_jobs=10000):
+def fetch_workday_jobs(career_url, max_jobs=10000, search_text=""):
     """Fetch every listing page up to the tenant's reported total or max_jobs safety cap."""
     cfg = parse_workday_url(career_url)
     results = []
@@ -208,7 +210,7 @@ def fetch_workday_jobs(career_url, max_jobs=10000):
     max_jobs = max(1, int(max_jobs))
 
     while offset < max_jobs:
-        payload = {"appliedFacets": {}, "limit": PAGE_SIZE, "offset": offset, "searchText": ""}
+        payload = {"appliedFacets": {}, "limit": PAGE_SIZE, "offset": offset, "searchText": search_text}
         response = None
         for attempt in range(4):
             try:
@@ -258,7 +260,7 @@ def fetch_workday_jobs(career_url, max_jobs=10000):
 
         offset += len(postings)
         total = data.get("total")
-        print(f"  Page offset {offset - len(postings)}: {len(postings)} listings; total reported: {total if total is not None else 'unknown'}")
+        if os.environ.get("VERBOSE"): print(f"  Page offset {offset - len(postings)}: {len(postings)} listings; total reported: {total if total is not None else 'unknown'}")
         if len(postings) < PAGE_SIZE:
             break
         # Some Workday tenants incorrectly report total=0 on later pages even while
@@ -272,3 +274,21 @@ def fetch_workday_jobs(career_url, max_jobs=10000):
         time.sleep(0.15)
 
     return results
+
+
+def confirm_sites(urls, workers=24):
+    """Fast parallel check that each career site's public jobs API responds."""
+    from concurrent.futures import ThreadPoolExecutor
+    unique = {}
+    for u in urls:
+        try:
+            c = parse_workday_url(u)
+        except ValueError:
+            continue
+        unique.setdefault((c["base"].lower(), c["site"].lower()), u)
+
+    def check(u):
+        return u if _api_has_jobs(parse_workday_url(u), requests.Session()) else None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return [u for u in pool.map(check, unique.values()) if u]

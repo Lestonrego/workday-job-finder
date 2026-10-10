@@ -61,7 +61,7 @@ def evaluate_job(resume_text, job):
     raw_data = json.dumps(job.get("raw", {}), ensure_ascii=False, default=str)
     user_prompt = f"""
 RESUME (candidate evidence):
-{resume_text[:10000]}
+{resume_text[:3500]}
 
 JOB INFORMATION:
 Title: {job.get('title', '')}
@@ -69,10 +69,10 @@ Company / tenant: {job.get('company', '')}
 Location from listing: {job.get('location', '')}
 Posted date: {job.get('posted_on', '')}
 Posting URL: {job.get('posting_url', '')}
-Full job description: {(job.get('description') or 'Not available')[:5000]}
+Full job description: {(job.get('description') or 'Not available')[:2500]}
 Experience requirement from posting: {job.get('experience_requirement', '')}
 Employment type from posting: {job.get('employment_type', '')}
-Raw listing fields: {raw_data[:4500]}
+Raw listing fields: {raw_data[:600]}
 
 First establish the location using the supplied evidence, including city/state-only locations. Then check whether the role requires prior professional experience. Set is_relevant=false if it is outside India, location cannot reasonably be established as India, it requires prior professional experience, is not an internship or full-time entry-level role, or is unrelated to the resume. In reasoning, briefly explain the location and experience decision. Do not invent missing information.
 """
