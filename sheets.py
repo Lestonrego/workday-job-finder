@@ -192,6 +192,8 @@ def compact_blank_rows(spreadsheet):
     for number, row in enumerate(values[1:], start=2):
         if not _is_blank(row):
             last = number
+    if last == 0:
+        return 0
     gaps = [n for n, row in enumerate(values[1:], start=2) if n < last and _is_blank(row)]
     if not gaps:
         return 0
@@ -303,3 +305,36 @@ def save_jobs(spreadsheet, records):
 def upsert_job(spreadsheet, record):
     added, _ = save_jobs(spreadsheet, [record])
     return "added" if added else "updated"
+
+
+SEEN_TAB = "Seen"
+
+
+def load_seen(spreadsheet, days=7):
+    """Keys of postings already judged in the last `days` days (so they are never re-evaluated)."""
+    try:
+        ws = spreadsheet.worksheet(SEEN_TAB)
+    except Exception:
+        ws = spreadsheet.add_worksheet(title=SEEN_TAB, rows=1000, cols=2)
+        ws.update(range_name="A1:B1", values=[["Key", "Seen At"]])
+        return set()
+    values = ws.get_all_values()[1:]
+    cutoff = datetime.now(IST) - timedelta(days=days)
+    keep = [r for r in values if len(r) >= 2 and (_parse_discovered_at(r[1]) or cutoff) > cutoff - timedelta(seconds=1)]
+    if len(keep) < len(values):
+        ws.clear()
+        ws.update(range_name="A1:B1", values=[["Key", "Seen At"]])
+        if keep:
+            ws.update(range_name=f"A2:B{len(keep) + 1}", values=keep, value_input_option="RAW")
+        print(f"Seen tab: pruned {len(values) - len(keep)} entries older than {days} days.")
+    return {r[0] for r in keep if r and r[0]}
+
+
+def add_seen(spreadsheet, keys):
+    keys = [k for k in dict.fromkeys(keys) if k]
+    if not keys:
+        return
+    ws = spreadsheet.worksheet(SEEN_TAB)
+    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    for i in range(0, len(keys), 2000):
+        ws.append_rows([[k, now] for k in keys[i:i + 2000]], value_input_option="RAW")

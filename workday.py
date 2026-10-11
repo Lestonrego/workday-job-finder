@@ -204,7 +204,7 @@ def enrich_workday_job(job):
         return job
 
 
-def fetch_workday_jobs(career_url, max_jobs=10000, search_text=""):
+def fetch_workday_jobs(career_url, max_jobs=10000, search_text="", applied_facets=None):
     """Fetch every listing page up to the tenant's reported total or max_jobs safety cap."""
     cfg = parse_workday_url(career_url)
     results = []
@@ -214,6 +214,8 @@ def fetch_workday_jobs(career_url, max_jobs=10000, search_text=""):
 
     while offset < max_jobs:
         payload = {"appliedFacets": {}, "limit": PAGE_SIZE, "offset": offset, "searchText": search_text}
+        if applied_facets:
+            payload["appliedFacets"] = applied_facets
         response = None
         for attempt in range(4):
             try:
@@ -227,7 +229,11 @@ def fetch_workday_jobs(career_url, max_jobs=10000, search_text=""):
                 if attempt == 3:
                     raise
                 time.sleep(1.5 * (attempt + 1))
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            print(f"  {cfg['tenant']}: non-JSON response (site blocks automated access); skipped.")
+            break
         postings = data.get("jobPostings") or []
         if not postings:
             break
@@ -295,10 +301,80 @@ def confirm_sites(urls, workers=24):
     def check(u):
         return u if _api_has_jobs(parse_workday_url(u), requests.Session()) else None
 
+    from concurrent.futures import as_completed
+    confirmed, done = [], 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        return [u for u in pool.map(check, unique.values()) if u]
+        futures = [pool.submit(check, u) for u in unique.values()]
+        for fut in as_completed(futures):
+            done += 1
+            result = fut.result()
+            if result:
+                confirmed.append(result)
+            if done % 200 == 0:
+                print(f"Validated {done}/{len(futures)} sites; {len(confirmed)} working.", flush=True)
+    return confirmed
 
 
 def pretty_company(tenant):
     """Last-resort readable company name from a Workday tenant id."""
     return re.sub(r"[-_]+", " ", tenant or "").strip().title()
+
+
+def find_india_facet(career_url, session=None):
+    """Ask the site which location filter selects India.
+
+    Returns {facetParameter: [ids]} to use as appliedFacets, None if the site has location
+    filters but no India jobs, or {} if the site exposes no location filter (filter locally).
+    """
+    cfg = parse_workday_url(career_url)
+    session = session or requests.Session()
+    try:
+        response = session.post(cfg["api"], json={"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""},
+                                headers=HEADERS, timeout=25)
+        data = response.json()
+    except Exception:
+        return {}
+    country, other, has_location_facet = {}, {}, [False]
+
+    def walk(nodes):
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            param = node.get("facetParameter") or ""
+            values = node.get("values")
+            if param and isinstance(values, list):
+                if "location" in param.lower():
+                    has_location_facet[0] = True
+                for v in values:
+                    if not isinstance(v, dict) or not v.get("id"):
+                        continue
+                    name = str(v.get("descriptor", "")).strip().lower()
+                    if param == "locationCountry" and name == "india":
+                        country.setdefault(param, []).append(v["id"])
+                    elif "location" in param.lower() and re.search(r"\bindia\b", name):
+                        other.setdefault(param, []).append(v["id"])
+            walk(node.get("facets"))
+
+    walk(data.get("facets"))
+    if country:
+        return country
+    if other:
+        return other
+    return None if has_location_facet[0] else {}
+
+
+def fetch_india_jobs(career_url, terms, max_jobs=300):
+    """India listings for each search term. Uses the site's own India filter when it has one."""
+    facet = find_india_facet(career_url)
+    if facet is None:
+        return []                       # site lists locations but none are in India
+    jobs, seen = [], set()
+    for term in terms:
+        for job in fetch_workday_jobs(career_url, max_jobs=max_jobs, search_text=term, applied_facets=facet or None):
+            url = job.get("posting_url", "")
+            if url in seen:
+                continue
+            seen.add(url)
+            job["india_filtered"] = bool(facet)
+            jobs.append(job)
+    return jobs

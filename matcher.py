@@ -67,61 +67,24 @@ def _retry_after_seconds(exc):
         return None
 
 
-def evaluate_job(resume_text, job, deadline=None):
-    """Evaluate one job. On a Groq rate limit, wait exactly as long as Groq says, then retry.
-
-    If the required wait would run past `deadline` (epoch seconds), raise QuotaExhausted.
-    """
+def _call_groq(system, user, deadline=None):
+    """One Groq chat call returning parsed JSON. Waits exactly as long as Groq says on rate limits."""
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Set GROQ_API_KEY.")
     model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
-    client = Groq(api_key=api_key, timeout=60.0, max_retries=0)
-
-    raw_data = json.dumps(job.get("raw", {}), ensure_ascii=False, default=str)
-    user_prompt = f"""
-RESUME (candidate evidence):
-{resume_text[:3500]}
-
-JOB INFORMATION:
-Title: {job.get('title', '')}
-Company: {job.get('company', '')}
-Location from listing: {job.get('location', '')}
-Posted date: {job.get('posted_on', '')}
-Posting URL: {job.get('posting_url', '')}
-Full job description: {(job.get('description') or 'Not available')[:2500]}
-Experience requirement from posting: {job.get('experience_requirement', '')}
-Employment type from posting: {job.get('employment_type', '')}
-Raw listing fields: {raw_data[:600]}
-
-First establish the location using the supplied evidence, including city/state-only locations. Then check whether the role requires prior professional experience. Set is_relevant=false if it is outside India, location cannot reasonably be established as India, it requires prior professional experience, is not an internship or full-time entry-level role, or is unrelated to the resume. Internships and graduate roles starting in 2026 or 2027 are valid. In reasoning, briefly explain the location and experience decision. Do not invent missing information.
-"""
-
+    client = Groq(api_key=api_key, timeout=90.0, max_retries=0)
+    extra = {"reasoning_effort": "low"} if "gpt-oss" in model else None   # fewer hidden tokens
     attempts = max(1, int(os.environ.get("GROQ_MAX_ATTEMPTS", "4")))
     failures = rate_waits = 0
     while True:
         try:
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-            result = json.loads(completion.choices[0].message.content)
-            result.setdefault("is_relevant", False)
-            result.setdefault("match_score", 0)
-            result.setdefault("job_category", "Unclear")
-            result.setdefault("employment_type", "Unclear")
-            result.setdefault("experience_requirement", "Unclear")
-            result.setdefault("matching_skills", [])
-            result.setdefault("missing_or_learnable_skills", [])
-            result.setdefault("eligibility_concerns", [])
-            result.setdefault("reasoning", "LLM did not provide reasoning.")
-            result.setdefault("recommendation", "Review")
-            return result
+            kwargs = dict(model=model, temperature=0.1, response_format={"type": "json_object"},
+                          messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+            if extra:
+                kwargs["extra_body"] = extra
+            completion = client.chat.completions.create(**kwargs)
+            return json.loads(completion.choices[0].message.content)
         except Exception as exc:
             message = str(exc).lower()
             status = getattr(exc, "status_code", None)
@@ -132,13 +95,58 @@ First establish the location using the supplied evidence, including city/state-o
                     raise QuotaExhausted(f"Groq asks to wait {wait / 60:.0f} min; not enough run time left.") from exc
                 if rate_waits > 200:
                     raise RuntimeError(f"Groq still rate limited after {rate_waits} waits: {exc}") from exc
-                print(f"Groq rate limit: waiting {wait:.0f}s as instructed, then retrying.")
+                print(f"Groq rate limit: waiting {wait:.0f}s as instructed, then retrying.", flush=True)
                 time.sleep(wait)
                 continue
             failures += 1
             if failures >= attempts:
                 raise RuntimeError(f"Groq evaluation failed after {attempts} attempt(s): {exc}") from exc
             time.sleep(min(8, 2 * failures))
+
+
+BATCH_SYSTEM = SYSTEM_PROMPT.split("Return valid JSON only")[0] + """
+You will receive several jobs, each with an id. Judge every job independently.
+Return valid JSON only, exactly this shape, with one entry per job id:
+{"results": [{"id": 1, "is_relevant": true, "employment_type": "Internship or Full-time", "eligibility_concerns": ["short note"], "reasoning": "one short sentence"}]}
+"""
+
+
+def evaluate_jobs_batch(resume_text, jobs, deadline=None):
+    """Evaluate several jobs in ONE Groq call (the resume is sent once). Returns results aligned with jobs."""
+    blocks = []
+    for i, job in enumerate(jobs, start=1):
+        blocks.append(
+            f"JOB id={i}\nTitle: {job.get('title', '')}\nCompany: {job.get('company', '')}\n"
+            f"Location: {job.get('location', '')}\nPosted: {job.get('posted_on', '')}\n"
+            f"Employment type: {job.get('employment_type', '')}\n"
+            f"Description: {(job.get('description') or 'Not available')[:1300]}\n")
+    user = (f"RESUME:\n{resume_text[:3000]}\n\n" + "\n".join(blocks) +
+            "\nAll jobs below were pre-filtered to India locations; still reject any that need prior professional "
+            "experience, are unrelated to the resume, or are not internships/entry-level. Internships and graduate roles "
+            "starting in 2026 or 2027 are valid.")
+    data = _call_groq(BATCH_SYSTEM, user, deadline)
+    by_id = {}
+    for item in data.get("results", []) if isinstance(data, dict) else []:
+        try:
+            by_id[int(item.get("id"))] = item
+        except (TypeError, ValueError):
+            continue
+    results = []
+    for i in range(1, len(jobs) + 1):
+        item = by_id.get(i)
+        if item is None:
+            results.append(None)       # model skipped this job; caller keeps it for review
+            continue
+        item.setdefault("is_relevant", False)
+        item.setdefault("employment_type", "")
+        item.setdefault("eligibility_concerns", [])
+        results.append(item)
+    return results
+
+
+def evaluate_job(resume_text, job, deadline=None):
+    """Single-job evaluation (kept for compatibility)."""
+    return evaluate_jobs_batch(resume_text, [job], deadline)[0] or {"is_relevant": False}
 
 
 def now_ist():
