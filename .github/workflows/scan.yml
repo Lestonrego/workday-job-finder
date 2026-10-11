@@ -1,40 +1,39 @@
 name: Scheduled Workday Job Scan
 
 on:
-  workflow_dispatch:
   schedule:
-    # 12:00 AM IST = 18:30 UTC (previous UTC day)
-    - cron: "30 18 * * *"
-    # 12:00 PM IST = 06:30 UTC
-    - cron: "30 6 * * *"
-    # 06:00 PM IST = 12:30 UTC
-    - cron: "30 12 * * *"
+    - cron: "30 18 * * *"   # 12:00 AM IST
+    - cron: "30 6 * * *"    # 12:00 PM IST
+  workflow_dispatch:          # optional manual "Run workflow" button
 
-permissions:
-  contents: read
+concurrency:
+  group: job-scan
+  cancel-in-progress: false  # never start a second scan while one is still running
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 340
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run job scanner
+        run: python scanner.py
         env:
+          PYTHONUNBUFFERED: "1"
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GROQ_MODEL: ${{ vars.GROQ_MODEL }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL || 'openai/gpt-oss-20b' }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          MAX_JOBS_PER_SITE: "100000"
+          MAX_JOBS_PER_SITE: "300"
           MAX_DISCOVERED_SITES: "5000"
-          DISCOVERY_PAGES_PER_QUERY: "3"
-          GROQ_MAX_ATTEMPTS: "5"
-        run: python scanner.py
+          RUN_BUDGET_MIN: "270"
