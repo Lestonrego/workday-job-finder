@@ -192,6 +192,7 @@ def enrich_workday_job(job):
         detail = fetch_job_detail(cfg, job.get("posting_url", ""), session)
         if detail:
             job["company"] = job.get("company_known") or detail.get("company") or job.get("company", "")
+            job["company_verified"] = bool(job.get("company_known") or detail.get("company"))
             job["title"] = detail.get("detail_title") or job.get("title", "")
             job["location"] = detail.get("detail_location") or job.get("location", "")
             job["employment_type"] = detail.get("employment_type") or job.get("employment_type", "")

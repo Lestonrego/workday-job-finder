@@ -13,7 +13,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 70
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,6 +22,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+
+      - name: Restore site list cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: sites-cache-${{ github.run_id }}
+          restore-keys: sites-cache-
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -37,4 +45,4 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAX_JOBS_PER_SITE: "300"
           MAX_DISCOVERED_SITES: "5000"
-          RUN_BUDGET_MIN: "270"
+          RUN_BUDGET_MIN: "45"

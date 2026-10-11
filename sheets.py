@@ -338,3 +338,26 @@ def add_seen(spreadsheet, keys):
     now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for i in range(0, len(keys), 2000):
         ws.append_rows([[k, now] for k in keys[i:i + 2000]], value_input_option="RAW")
+
+
+def purge_rows(spreadsheet, should_delete):
+    """Delete job rows for which should_delete(row_dict) is true. Returns the number removed."""
+    ws = spreadsheet.worksheet("Jobs")
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return 0
+    headers = values[0]
+    doomed = []
+    for number, row in enumerate(values[1:], start=2):
+        row = row + [""] * (len(headers) - len(row))
+        if _is_blank(row):
+            continue
+        if should_delete(dict(zip(headers, row))):
+            doomed.append(number)
+    if not doomed:
+        return 0
+    spreadsheet.batch_update({"requests": [{
+        "deleteDimension": {"range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": n - 1, "endIndex": n}}
+    } for n in sorted(doomed, reverse=True)]})
+    print(f"Purged {len(doomed)} low-quality row(s) from earlier runs.")
+    return len(doomed)

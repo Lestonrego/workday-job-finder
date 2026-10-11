@@ -96,8 +96,9 @@ def _call_groq(system, user, deadline=None):
         free = [i for i, k in enumerate(keys) if _BLOCKED_UNTIL.get(k, 0) <= now]
         if not free:
             wait = min(_BLOCKED_UNTIL[k] for k in keys) - now + 1
-            if deadline and now + wait > deadline:
-                raise QuotaExhausted(f"All {len(keys)} Groq key(s) are limited; soonest reset in {wait / 60:.0f} min, not enough run time left.")
+            max_wait = float(os.environ.get("MAX_GROQ_WAIT_MIN", "3")) * 60   # idle time costs Actions minutes
+            if wait > max_wait or (deadline and now + wait > deadline):
+                raise QuotaExhausted(f"All {len(keys)} Groq key(s) are limited; soonest reset in {wait / 60:.0f} min.")
             rate_waits += 1
             if rate_waits > 300:
                 raise RuntimeError("Groq still rate limited after many waits.")
@@ -132,8 +133,10 @@ def _call_groq(system, user, deadline=None):
 
 BATCH_SYSTEM = SYSTEM_PROMPT.split("Return valid JSON only")[0] + """
 You will receive several jobs, each with an id. Judge every job independently.
+Decide like a careful recruiter reading the job description. Set is_relevant=true when ALL are true: (a) it is an internship or a genuine fresher/graduate/entry-level job, and the description does NOT demand prior professional experience (reject "1+ years", "2-5 years", mid-level or senior roles); (b) the role is in AI/ML, data science/analytics/engineering, software/IT, or a closely related technical field that the resume supports; (c) the candidate could realistically do it - a few missing or learnable skills are fine, but reject if the core required skills are clearly absent. Reject non-technical roles (operations, finance, sales, HR, legal, mechanical, etc.) even when titled intern. Roles starting in 2026 or 2027 are valid. If (a) and (b) hold and you are only unsure about skills, accept with a lower score (50-65).
+Also give match_score 0-100 (resume fit); 60+ means a strong match, 50-59 an acceptable one.
 Return valid JSON only, exactly this shape, with one entry per job id:
-{"results": [{"id": 1, "is_relevant": true, "employment_type": "Internship or Full-time", "eligibility_concerns": ["short note"], "reasoning": "one short sentence"}]}
+{"results": [{"id": 1, "is_relevant": true, "match_score": 80, "employment_type": "Internship or Full-time", "company_name": "official company name if you can tell it from the description, else empty", "eligibility_concerns": ["short note"], "reasoning": "one short sentence"}]}
 """
 
 
@@ -141,15 +144,21 @@ def evaluate_jobs_batch(resume_text, jobs, deadline=None):
     """Evaluate several jobs in ONE Groq call (the resume is sent once). Returns results aligned with jobs."""
     blocks = []
     for i, job in enumerate(jobs, start=1):
+        desc = job.get("description") or ""
+        yrs = required_years(desc)
         blocks.append(
-            f"JOB id={i}\nTitle: {job.get('title', '')}\nCompany: {job.get('company', '')}\n"
+            f"JOB id={i}\nTitle: {job.get('title', '')}\nCompany (may be an abbreviation or tenant id): {job.get('company', '')}\n"
             f"Location: {job.get('location', '')}\nPosted: {job.get('posted_on', '')}\n"
             f"Employment type: {job.get('employment_type', '')}\n"
-            f"Description: {(job.get('description') or 'Not available')[:1300]}\n")
+            f"Auto-detected mandatory experience in JD: {str(yrs) + '+ years' if yrs else 'none found'}\n"
+            f"Job description (opening + all requirement/experience sentences): {key_excerpt(desc) or 'Not available'}\n")
     user = (f"RESUME:\n{resume_text[:3000]}\n\n" + "\n".join(blocks) +
-            "\nAll jobs below were pre-filtered to India locations; still reject any that need prior professional "
-            "experience, are unrelated to the resume, or are not internships/entry-level. Internships and graduate roles "
-            "starting in 2026 or 2027 are valid.")
+            "\nRead each job description carefully, especially the qualification and experience sentences. All jobs were "
+            "pre-filtered to India locations. Reject any job that requires prior professional experience (e.g. 'Bachelor's "
+            "degree and 2 years of experience', 'minimum 3 years'), is not an internship or true entry-level role, or is "
+            "unrelated to the resume. Internships and graduate roles starting in 2026 or 2027 are valid. Judge by the "
+            "description, not only the title: an internship with a generic title can still be right if the description "
+            "matches the resume.")
     data = _call_groq(BATCH_SYSTEM, user, deadline)
     by_id = {}
     for item in data.get("results", []) if isinstance(data, dict) else []:
@@ -164,6 +173,7 @@ def evaluate_jobs_batch(resume_text, jobs, deadline=None):
             results.append(None)       # model skipped this job; caller keeps it for review
             continue
         item.setdefault("is_relevant", False)
+        item.setdefault("match_score", 0)
         item.setdefault("employment_type", "")
         item.setdefault("eligibility_concerns", [])
         results.append(item)
@@ -179,35 +189,92 @@ def now_ist():
     return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
 
 
-FIELD_WORDS = re.compile(
-    r"\b(data|analyt\w*|machine learning|ml|ai|artificial intelligence|python|sql|software|developer|"
-    r"engineer\w*|research|nlp|deep learning|statistic\w*|bi|business intelligence|science|programmer|"
-    r"full stack|backend|frontend|cloud|devops|qa|test\w*)\b", re.I)
+ENTRY_TITLE = re.compile(
+    r"\b(intern(ship)?s?|co-?op|trainee|graduate|fresher|apprentice|campus|new grad(uate)?|early (career|talent)|"
+    r"entry[- ]level|junior|jr\.?|20(26|27)|associate)\b", re.I)
+# Entry-level evidence inside the job description (for titles that do not say it).
+JD_ENTRY = re.compile(
+    r"\b(fresher|fresh graduates?|recent graduates?|new grad\w*|entry[- ]level|campus|early career|internship|"
+    r"intern\b|no (prior )?(work |professional )?experience|0\s*(?:-|to|–)\s*[12]\s*years?|"
+    r"graduating in 202[5-8]|class of 202[5-8]|pursuing (a |your )?(bachelor|master|degree|b\.?tech|m\.?tech))", re.I)
+SENIOR_TITLE = re.compile(
+    r"\b(senior|sr\.?|staff|principal|lead|manager|director|head of|vp|vice president|architect|chief|"
+    r"specialist iii?|iv|distinguished|fellow)\b", re.I)
+FIELD_TITLE = re.compile(
+    r"\b(software|developer|development|programmer|full[- ]?stack|back[- ]?end|front[- ]?end|web|cloud|devops|sde|swe|"
+    r"data|analytics?|machine learning|ml|ai|artificial intelligence|nlp|genai|generative|llm|python|sql|"
+    r"research|computer|information technology|it|cyber|automation|engineering|engineer)\b", re.I)
+STRONG_DESC = re.compile(
+    r"\b(python|sql|machine learning|deep learning|data science|data analysis|data analytics|software development|"
+    r"programming|nlp|generative ai|llm|power bi|tableau|pandas|tensorflow|pytorch)\b", re.I)
+UNRELATED_TITLE = re.compile(
+    r"\b(sales|marketing|finance|financial|accounting|accountant|audit|tax|legal|counsel|hr|human resources|recruit\w*|"
+    r"talent acquisition|procurement|supply chain|customer service|customer support|security guard|officer|"
+    r"executive|nurse|clinical|pharma\w*|medical|real estate|actuarial|compliance|payroll|logistics|warehouse)\b", re.I)
+_NUMWORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
 
 def required_years(text):
-    """Smallest mandatory years of experience found in the text (0 if none/preferred only)."""
+    """Smallest MANDATORY years of experience in the text. 0 when none, preferred-only, or the range starts at 0."""
+    text = re.sub(r"\b(" + "|".join(_NUMWORDS) + r")\b(?=\s*(?:\(\d+\))?\s*\+?\s*years?)",
+                  lambda m: str(_NUMWORDS[m.group(1).lower()]), text or "", flags=re.I)
     need = 0
-    for m in re.finditer(r"(\d+)\s*\+?\s*(?:-|\u2013|to)?\s*(\d+)?\s*(?:years?|yrs?)", text or "", re.I):
-        window = text[max(0, m.start() - 80): m.end() + 80].lower()
-        if "experience" not in window or "prefer" in window or "plus" in window:
-            continue
+    for m in re.finditer(r"(\d+)\s*\+?\s*(?:-|–|to)?\s*(\d+)?\s*\+?\s*(?:years?|yrs?)", text, re.I):
         low = int(m.group(1))
+        if low <= 0 or low > 30:
+            continue
+        before = text[max(0, m.start() - 90): m.start()].lower()
+        after = text[m.end(): m.end() + 90].lower()
+        before = re.split(r"[.;:\n]", before)[-1]      # stay inside the same sentence
+        after = re.split(r"[.;\n]", after)[0]
+        if "experience" not in before + after:
+            continue
+        if re.search(r"prefer|plus\b|bonus|nice to have|desirable|good to have", before + " " + after):
+            continue
         need = low if need == 0 else min(need, low)
     return need
 
 
+def key_excerpt(desc, limit=1900):
+    """Opening of the JD plus every sentence about experience/qualifications (these are usually buried far down)."""
+    desc = re.sub(r"\s+", " ", desc or "").strip()
+    head = desc[:450]
+    pattern = re.compile(r"\b(years?|yrs?|experience|qualifications?|requirements?|required|must|minimum|degree|graduat\w*|"
+                         r"pursuing|intern\w*|fresher|entry|basic|mandatory|eligib\w*|proficien\w*|skills?)\b", re.I)
+    picked, seen = [], set(head.lower().split(". "))
+    for sentence in re.split(r"(?<=[.!?;])\s+", desc[450:]):
+        s = sentence.strip()
+        if 12 < len(s) < 400 and pattern.search(s) and s.lower() not in seen:
+            picked.append(s)
+            seen.add(s.lower())
+    return (head + " ... " + " ".join(picked))[:limit]
+
+
 def rule_based_evaluate(job):
-    """No-LLM fallback: field keywords + mandatory-experience check."""
+    """Free pre-filter. It only removes the clearly wrong; the AI judges the rest from the job description.
+
+    Dropped: senior titles, mandatory experience in the JD (non-interns), no entry-level signal in the title OR
+    the JD, and clearly non-technical functions with no tech evidence.
+    """
     title = job.get("title", "")
-    text = f"{title} {job.get('description', '')[:3000]}"
-    is_intern = "intern" in title.lower()
-    years = required_years(job.get("description", ""))
-    relevant = bool(FIELD_WORDS.search(title)) or bool(FIELD_WORDS.search(job.get("description", "")[:1500]))
-    if years >= 1 and not is_intern:
-        relevant = False
+    desc = job.get("description", "") or ""
+    is_intern = bool(re.search(r"\b(intern(ship)?s?|trainee|apprentice)\b", title, re.I))
+    years = required_years(desc) or (1 if re.search(r"\b\d\s*[-–+]\s*\d?\s*(years|yrs)\b", title, re.I) else 0)
+    entry = bool(ENTRY_TITLE.search(title)) or bool(JD_ENTRY.search(desc))
+    tech = bool(FIELD_TITLE.search(title)) or len(set(x.group(0).lower() for x in STRONG_DESC.finditer(desc))) >= 2
+    why = ""
+    if not entry:
+        why = "no entry-level signal in title or JD"
+    elif SENIOR_TITLE.search(title) and not is_intern:
+        why = "senior title"
+    elif years >= 1 and not is_intern:
+        why = f"JD requires {years}+ years experience"
+    elif UNRELATED_TITLE.search(title) and not tech:
+        why = "non-technical role"
+    relevant = not why
     return {
         "is_relevant": relevant,
+        "why": why,
         "employment_type": "Internship" if is_intern else (job.get("employment_type") or "Full time (entry-level)"),
-        "eligibility_concerns": ["Matched by keyword rules (Groq unavailable); verify requirements manually"],
+        "eligibility_concerns": ["Keyword match only (AI review not completed); verify requirements"],
     }

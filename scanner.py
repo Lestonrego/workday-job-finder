@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import re
@@ -7,10 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
 from sheets import (get_spreadsheet, ensure_tabs, cleanup_expired_jobs, read_jobs, save_jobs,
-                    compact_blank_rows, remove_duplicate_rows, job_key, load_seen, add_seen)
+                    compact_blank_rows, remove_duplicate_rows, job_key, load_seen, add_seen, purge_rows)
 from workday import pretty_company, confirm_sites, discover_workday_sites, enrich_workday_job, fetch_india_jobs
 from discovery import discover_workday_sites_from_search, COMPANY_NAMES
-from matcher import evaluate_jobs_batch, now_ist, rule_based_evaluate, QuotaExhausted
+from matcher import evaluate_jobs_batch, now_ist, rule_based_evaluate, QuotaExhausted, required_years
 from pypdf import PdfReader
 
 load_dotenv()
@@ -100,6 +101,29 @@ def not_senior(title):
     return "intern" in (title or "").lower() or not SENIOR_RE.search(title or "")
 
 
+SITES_CACHE = ROOT / ".cache" / "sites.json"
+
+
+def load_sites_cache():
+    """Confirmed sites from a previous run (refreshed every SITES_CACHE_DAYS days)."""
+    try:
+        data = json.loads(SITES_CACHE.read_text(encoding="utf-8"))
+        max_age = float(os.environ.get("SITES_CACHE_DAYS", "7")) * 86400
+        if time.time() - data["saved_at"] < max_age and data["sites"]:
+            return data["sites"]
+    except Exception:
+        pass
+    return []
+
+
+def save_sites_cache(sites):
+    try:
+        SITES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        SITES_CACHE.write_text(json.dumps({"saved_at": time.time(), "sites": sites}), encoding="utf-8")
+    except Exception as exc:
+        print(f"Could not save site cache: {exc}")
+
+
 def pick_india_location(job):
     """Prefer an Indian location string for the sheet when a posting lists several locations."""
     detail = (job.get("raw") or {}).get("detail") or {}
@@ -112,37 +136,57 @@ def pick_india_location(job):
 
 def main():
     start = time.time()
-    budget = float(os.environ.get("RUN_BUDGET_MIN", "270")) * 60            # stay under the 6h Actions limit
+    budget = float(os.environ.get("RUN_BUDGET_MIN", "45")) * 60            # stay under the 6h Actions limit
     deadline = start + budget
-    ai_deadline = deadline - 600                                            # last 10 min: save the unverified rest
-    terms = [t.strip() for t in os.environ.get("SEARCH_TERMS", "intern,graduate,trainee,2027").split(",") if t.strip()]
+    ai_deadline = deadline - 240                                            # last 10 min: save the unverified rest
+    terms = [t.strip() for t in os.environ.get("SEARCH_TERMS", "intern,internship,trainee,graduate,fresher,entry level,early career,campus,new grad,apprentice,associate,junior,2027,2026").split(",") if t.strip()]
     batch_size = max(1, int(os.environ.get("LLM_BATCH", "8")))
     elapsed = lambda: (time.time() - start) / 60
 
     resume = read_resume_pdf()
-    manual = [l.strip() for l in read_config_text("career_sites.txt").splitlines()
-              if l.strip() and not l.strip().startswith("#")]
-    discovered = discover_workday_sites_from_search(max_sites=int(os.environ.get("MAX_DISCOVERED_SITES", "5000")))
-    candidates = list(dict.fromkeys(manual + discovered))
-    if not candidates:
-        raise RuntimeError("Discovery returned no candidate sites.")
-    sites = confirm_sites(candidates)
-    print(f"{len(sites)} confirmed Workday site(s) of {len(candidates)} candidates ({elapsed():.1f} min).")
-    if not sites:
-        raise RuntimeError("No working public Workday career sites were found.")
+    sites = load_sites_cache()
+    if sites:
+        print(f"Using {len(sites)} cached Workday site(s); skipping discovery to save Actions minutes.")
+    else:
+        manual = [l.strip() for l in read_config_text("career_sites.txt").splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+        discovered = discover_workday_sites_from_search(max_sites=int(os.environ.get("MAX_DISCOVERED_SITES", "5000")))
+        candidates = list(dict.fromkeys(manual + discovered))
+        if not candidates:
+            raise RuntimeError("Discovery returned no candidate sites.")
+        sites = confirm_sites(candidates)
+        print(f"{len(sites)} confirmed Workday site(s) of {len(candidates)} candidates ({elapsed():.1f} min).")
+        if not sites:
+            raise RuntimeError("No working public Workday career sites were found.")
+        save_sites_cache(sites)
 
     spreadsheet = get_spreadsheet()
     ensure_tabs(spreadsheet)
     cleanup_expired_jobs(spreadsheet, max_age_days=3)
     remove_duplicate_rows(spreadsheet)
+
+    def low_quality(row):
+        note = (row.get("Eligibility Concerns") or "").lower()
+        if "ai review not completed" in note or "keyword match only" in note:
+            return not rule_based_evaluate({"title": row.get("Job Title", ""), "description": ""})["is_relevant"]
+        return bool(re.search(r"does not meet|not meet|\d+\s*[-\u2013+]\s*\d*\s*years|\d+\+?\s*years|lacks|missing required", note))
+
+    purge_rows(spreadsheet, low_quality)          # clean up junk written by earlier runs
     compact_blank_rows(spreadsheet)
     _, sheet_rows, _ = read_jobs(spreadsheet)
     known = {job_key(r.get("Application URL", "")) for r in sheet_rows}
     known |= load_seen(spreadsheet)
     errors, seen_new = [], []
+    samples = {}
+
+    def note(reason, job, extra=""):
+        bucket = samples.setdefault(reason, [0, []])
+        bucket[0] += 1
+        if len(bucket[1]) < 12:
+            bucket[1].append(f"{job.get('company', '')} | {job.get('title', '')} {extra}".strip())
 
     # ---- Phase 1: only India listings (server-side India filter), intern/graduate/trainee/2027 searches.
-    cap = min(int(os.environ.get("MAX_JOBS_PER_SITE", "300")), 400)
+    cap = min(int(os.environ.get("MAX_JOBS_PER_SITE", "400")), 400)
 
     def scan_site(site):
         host = urlparse(site).netloc.lower()
@@ -156,6 +200,7 @@ def main():
                 if is_clearly_outside_india(loc) or not maybe_india(loc):
                     continue
             if not not_senior(job.get("title", "")):
+                note("senior title (at listing)", job)
                 continue
             out.append(job)
         return out
@@ -171,7 +216,7 @@ def main():
                 errors.append(f"{futures[fut]}: {exc}")
             if done % 100 == 0:
                 print(f"Fetched {done}/{len(sites)} sites; {len(pending)} India jobs; {elapsed():.1f} min.")
-            if time.time() - start > budget * 0.4:
+            if time.time() - start > budget * 0.35:
                 print("Fetch time budget reached; continuing with what was collected.")
                 for f in futures:
                     f.cancel()
@@ -190,16 +235,19 @@ def main():
         job = enrich_workday_job(job)
         detail = (job.get("raw") or {}).get("detail") or {}
         extra = " ".join(map(str, detail.get("additionalLocations") or []))
-        if not definitely_india(f"{job.get('location', '')} {extra}"):
+        if not job.get("india_filtered") and not definitely_india(f"{job.get('location', '')} {extra}"):
+            note("location not verifiably India", job, f"[{job.get('location', '')}]")
             return key, job, "not_india"
         job["location"] = pick_india_location(job)
-        if not rule_based_evaluate(job)["is_relevant"]:
+        verdict = rule_based_evaluate(job)
+        if not verdict["is_relevant"]:
+            note("filtered: " + verdict["why"], job)
             return key, job, "rule_reject"
         return key, job, "ok"
 
     stats = {"not_india": 0, "rule_reject": 0, "ai_reject": 0}
     shortlist = []
-    with ThreadPoolExecutor(max_workers=int(os.environ.get("DETAIL_WORKERS", "8"))) as pool:
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("DETAIL_WORKERS", "12"))) as pool:
         for n, outcome in enumerate(pool.map(prepare, pending), start=1):
             try:
                 key, job, verdict = outcome
@@ -213,7 +261,7 @@ def main():
                 seen_new.append(key)
             if n % 500 == 0:
                 print(f"Checked details {n}/{len(pending)}; shortlist {len(shortlist)}; {elapsed():.1f} min.")
-            if time.time() > deadline - 900:
+            if time.time() > deadline - 420:
                 print("Out of time during detail checks.")
                 break
     print(f"Shortlist for AI review: {len(shortlist)} job(s). Dropped: {stats}.")
@@ -225,9 +273,10 @@ def main():
         concerns = result.get("eligibility_concerns", []) if result else []
         note = "; ".join(map(str, concerns))
         if unverified:
-            note = "AI review not completed - keyword match only, check requirements manually"
+            note = "Keyword match only (AI review not completed); verify requirements"
         return {
-            "Company Name": job.get("company", ""),
+            "Company Name": (job.get("company") if job.get("company_verified") else "")
+                            or ((result or {}).get("company_name") or "").strip() or job.get("company", ""),
             "Job Title": job.get("title", ""),
             "Location": job.get("location", ""),
             "Employment Type": (result or {}).get("employment_type") or job.get("employment_type") or "Internship/Entry-level",
@@ -262,11 +311,15 @@ def main():
             for (key, job), result in zip(chunk, results):
                 if result is None:                      # model skipped it: keep for manual review
                     records.append(to_record(job, None, unverified=True))
-                elif result.get("is_relevant"):
+                elif required_years(job.get("description", "")) >= 1 and "intern" not in job.get("title", "").lower():
+                    stats["ai_reject"] += 1          # JD demands experience; never trust the AI over that
+                    note("JD requires experience (override)", job)
+                elif result.get("is_relevant") and float(result.get("match_score") or 0) >= float(os.environ.get("MIN_MATCH_SCORE", "50")):
                     records.append(to_record(job, result))
                     print(f"Match: {job.get('company')} | {job.get('title')} | {job.get('location')}")
                 else:
                     stats["ai_reject"] += 1
+                    note("AI rejected", job, f"-> {str(result.get('reasoning', ''))[:110]} (score {result.get('match_score', '')})")
                 keys.append(key)
             write(records, keys)
             time.sleep(float(os.environ.get("LLM_DELAY_SEC", "1")))
@@ -277,11 +330,18 @@ def main():
         # Anything the AI did not get to is still saved so you can check it manually.
         leftovers = shortlist[index:]
         if leftovers:
-            write([to_record(j, None, unverified=True) for _, j in leftovers], [k for k, _ in leftovers])
-            print(f"Saved {len(leftovers)} job(s) without AI review.")
+            cap_unverified = int(os.environ.get("MAX_UNVERIFIED", "40"))
+            take = leftovers[:cap_unverified]          # internships / 2027 roles come first
+            write([to_record(j, None, unverified=True) for _, j in take], [k for k, _ in take])
+            print(f"Saved {len(take)} job(s) without AI review; {len(leftovers) - len(take)} left for the next run.")
         add_seen(spreadsheet, seen_new)
 
     cleanup_expired_jobs(spreadsheet, max_age_days=3)
+    print("---- Why jobs were dropped (count, then examples) ----")
+    for reason, (count, examples) in sorted(samples.items(), key=lambda kv: -kv[1][0]):
+        print(f"[{count}] {reason}")
+        for ex in examples:
+            print(f"      {ex}")
     print(f"Finished in {elapsed():.1f} min. New rows: {saved}; AI rejected: {stats['ai_reject']}; "
           f"dropped: not India {stats['not_india']}, rules {stats['rule_reject']}; errors: {len(errors)}.")
     if errors:
