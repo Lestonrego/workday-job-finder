@@ -67,17 +67,47 @@ def _retry_after_seconds(exc):
         return None
 
 
+_BLOCKED_UNTIL = {}     # api key -> epoch time until which Groq has rate-limited it
+_CURRENT = [0]
+
+
+def _load_keys():
+    raw = os.environ.get("GROQ_API_KEYS", "") + "\n" + os.environ.get("GROQ_API_KEY", "")
+    keys = [k.strip() for k in re.split(r"[,\s;]+", raw) if k.strip()]
+    return list(dict.fromkeys(keys))
+
+
 def _call_groq(system, user, deadline=None):
-    """One Groq chat call returning parsed JSON. Waits exactly as long as Groq says on rate limits."""
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Set GROQ_API_KEY.")
+    """One Groq chat call returning parsed JSON.
+
+    Several accounts' keys can be supplied (GROQ_API_KEYS, comma separated). When a key hits its
+    limit, the next key is used at once; only when ALL keys are limited does it wait as long as
+    the soonest one needs.
+    """
+    keys = _load_keys()
+    if not keys:
+        raise RuntimeError("Set GROQ_API_KEY (or GROQ_API_KEYS with several keys).")
     model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
-    client = Groq(api_key=api_key, timeout=90.0, max_retries=0)
     extra = {"reasoning_effort": "low"} if "gpt-oss" in model else None   # fewer hidden tokens
     attempts = max(1, int(os.environ.get("GROQ_MAX_ATTEMPTS", "4")))
     failures = rate_waits = 0
     while True:
+        now = time.time()
+        free = [i for i, k in enumerate(keys) if _BLOCKED_UNTIL.get(k, 0) <= now]
+        if not free:
+            wait = min(_BLOCKED_UNTIL[k] for k in keys) - now + 1
+            if deadline and now + wait > deadline:
+                raise QuotaExhausted(f"All {len(keys)} Groq key(s) are limited; soonest reset in {wait / 60:.0f} min, not enough run time left.")
+            rate_waits += 1
+            if rate_waits > 300:
+                raise RuntimeError("Groq still rate limited after many waits.")
+            print(f"All {len(keys)} Groq key(s) limited; waiting {wait:.0f}s as instructed.", flush=True)
+            time.sleep(max(1, wait))
+            continue
+        idx = _CURRENT[0] if _CURRENT[0] in free else free[0]
+        _CURRENT[0] = idx
+        key = keys[idx]
+        client = Groq(api_key=key, timeout=90.0, max_retries=0)
         try:
             kwargs = dict(model=model, temperature=0.1, response_format={"type": "json_object"},
                           messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
@@ -89,14 +119,10 @@ def _call_groq(system, user, deadline=None):
             message = str(exc).lower()
             status = getattr(exc, "status_code", None)
             if status == 429 or "rate_limit" in message or "rate limit" in message:
-                wait = _retry_after_seconds(exc) or min(60, 15 * (rate_waits + 1))
-                rate_waits += 1
-                if deadline and time.time() + wait > deadline:
-                    raise QuotaExhausted(f"Groq asks to wait {wait / 60:.0f} min; not enough run time left.") from exc
-                if rate_waits > 200:
-                    raise RuntimeError(f"Groq still rate limited after {rate_waits} waits: {exc}") from exc
-                print(f"Groq rate limit: waiting {wait:.0f}s as instructed, then retrying.", flush=True)
-                time.sleep(wait)
+                wait = _retry_after_seconds(exc) or 60
+                _BLOCKED_UNTIL[key] = time.time() + wait
+                if len(keys) > 1:
+                    print(f"Groq key {idx + 1}/{len(keys)} rate limited ({wait / 60:.0f} min); switching key.", flush=True)
                 continue
             failures += 1
             if failures >= attempts:
