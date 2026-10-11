@@ -44,5 +44,5 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAX_JOBS_PER_SITE: "300"
-          MAX_DISCOVERED_SITES: "5000"
+          MAX_DISCOVERED_SITES: "20000"
           RUN_BUDGET_MIN: "45"

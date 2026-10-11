@@ -77,6 +77,22 @@ FALLBACK_WORKDAY_SITES = [
 ]
 
 
+def _get_retry(url, params=None, timeout=120, tries=3):
+    """GET with a couple of retries (public index servers often answer 502/504 on the first try)."""
+    last = None
+    for attempt in range(tries):
+        try:
+            response = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            if response.status_code == 200:
+                return response
+            last = response
+        except Exception as exc:
+            last = None
+            print(f"  retry {attempt + 1}/{tries}: {str(exc)[:80]}")
+        time.sleep(3 * (attempt + 1))
+    return last
+
+
 def _env_int(name, default):
     try:
         return max(0, int(os.environ.get(name, str(default))))
@@ -130,6 +146,8 @@ def _career_root(url):
 COMPANY_NAMES = {}
 
 LISTING_SOURCES = [
+    "https://raw.githubusercontent.com/vanshb03/New-Grad-2027/dev/.github/scripts/listings.json",
+    "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/.github/scripts/listings.json",
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
     "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
@@ -185,9 +203,9 @@ def _discover_common_crawl(found, hosts, max_sites):
             if len(found) >= max_sites:
                 return
             try:
-                response = requests.get(api, params={**params, "page": page}, headers=HEADERS, timeout=120)
-                if response.status_code != 200:
-                    print(f"Common Crawl page {page}: HTTP {response.status_code}")
+                response = _get_retry(api, params={**params, "page": page}, timeout=120)
+                if response is None or response.status_code != 200:
+                    print(f"Common Crawl page {page}: HTTP {getattr(response, 'status_code', 'error')}")
                     continue
                 before = len(found)
                 for line in response.text.splitlines():
@@ -232,6 +250,36 @@ def _discover_wayback(found, hosts, max_sites):
         print(f"Wayback CDX: {len(found) - before} new site(s).")
     except Exception as exc:
         print(f"Wayback CDX failed: {exc}")
+
+
+def _discover_wayback_roots(found, hosts, max_sites):
+    """Archived career-site ROOT pages of every Workday shard (wd1, wd5, wd12 ...).
+
+    Filtering to root pages returns one URL per career site, so the result limit reaches far more
+    distinct employers than listing every job URL.
+    """
+    limit = _env_int("WAYBACK_ROOT_LIMIT", 60000)
+    if not limit:
+        return
+    shards = [x.strip() for x in os.environ.get("WD_SHARDS", "1,2,3,4,5,10,12,103,108,501,502,503,504").split(",") if x.strip()]
+    pattern = r"original:https?://[^/]+/(en-[A-Za-z]{2}/)?[^/?#]+/?$"
+
+    def one(n):
+        response = _get_retry(
+            "https://web.archive.org/cdx/search/cdx",
+            params={"url": f"*.wd{n}.myworkdayjobs.com", "output": "txt", "fl": "original", "collapse": "urlkey",
+                    "filter": ["statuscode:200", pattern], "limit": str(limit)},
+            timeout=150, tries=2)
+        if response is None or response.status_code != 200:
+            return n, [], getattr(response, "status_code", "error")
+        return n, response.text.splitlines(), 200
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for n, lines, status in pool.map(one, shards):
+            before = len(found)
+            for line in lines:
+                _add_candidate(line.strip(), found, hosts)
+            print(f"Wayback roots wd{n}: {len(lines)} page(s), {len(found) - before} new site(s) (HTTP {status}).")
 
 
 def _extract_links(soup, provider_name):
@@ -343,6 +391,7 @@ def discover_workday_sites_from_search(max_sites=5000):
         ("GitHub listings", _discover_github_listings),
         ("Common Crawl", _discover_common_crawl),
         ("Internet Archive", _discover_wayback),
+        ("Internet Archive roots", _discover_wayback_roots),
         ("Search engines", _discover_search_engines),
     ):
         try:

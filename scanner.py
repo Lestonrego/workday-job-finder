@@ -102,6 +102,7 @@ def not_senior(title):
 
 
 SITES_CACHE = ROOT / ".cache" / "sites.json"
+SITES_CACHE_VERSION = 2      # bump to force a fresh, wider discovery
 
 
 def load_sites_cache():
@@ -109,7 +110,7 @@ def load_sites_cache():
     try:
         data = json.loads(SITES_CACHE.read_text(encoding="utf-8"))
         max_age = float(os.environ.get("SITES_CACHE_DAYS", "7")) * 86400
-        if time.time() - data["saved_at"] < max_age and data["sites"]:
+        if data.get("version") == SITES_CACHE_VERSION and time.time() - data["saved_at"] < max_age and data["sites"]:
             return data["sites"]
     except Exception:
         pass
@@ -119,7 +120,7 @@ def load_sites_cache():
 def save_sites_cache(sites):
     try:
         SITES_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        SITES_CACHE.write_text(json.dumps({"saved_at": time.time(), "sites": sites}), encoding="utf-8")
+        SITES_CACHE.write_text(json.dumps({"version": SITES_CACHE_VERSION, "saved_at": time.time(), "sites": sites}), encoding="utf-8")
     except Exception as exc:
         print(f"Could not save site cache: {exc}")
 
@@ -144,13 +145,13 @@ def main():
     elapsed = lambda: (time.time() - start) / 60
 
     resume = read_resume_pdf()
+    manual = [l.strip() for l in read_config_text("career_sites.txt").splitlines()
+              if l.strip() and not l.strip().startswith("#")]
     sites = load_sites_cache()
     if sites:
         print(f"Using {len(sites)} cached Workday site(s); skipping discovery to save Actions minutes.")
     else:
-        manual = [l.strip() for l in read_config_text("career_sites.txt").splitlines()
-                  if l.strip() and not l.strip().startswith("#")]
-        discovered = discover_workday_sites_from_search(max_sites=int(os.environ.get("MAX_DISCOVERED_SITES", "5000")))
+        discovered = discover_workday_sites_from_search(max_sites=int(os.environ.get("MAX_DISCOVERED_SITES", "20000")))
         candidates = list(dict.fromkeys(manual + discovered))
         if not candidates:
             raise RuntimeError("Discovery returned no candidate sites.")
@@ -159,6 +160,13 @@ def main():
         if not sites:
             raise RuntimeError("No working public Workday career sites were found.")
         save_sites_cache(sites)
+    # Sites you list in career_sites.txt are ALWAYS scanned (even with a cache).
+    have = {urlparse(s).netloc.lower() + "/" + urlparse(s).path.strip("/").split("/")[-1].lower() for s in sites}
+    extra = [m for m in manual if urlparse(m).netloc.lower() + "/" + urlparse(m).path.strip("/").split("/")[-1].lower() not in have]
+    if extra:
+        ok = confirm_sites(extra)
+        print(f"career_sites.txt: {len(ok)} of {len(extra)} extra site(s) added and working.")
+        sites = sites + ok
 
     spreadsheet = get_spreadsheet()
     ensure_tabs(spreadsheet)
@@ -175,8 +183,11 @@ def main():
     compact_blank_rows(spreadsheet)
     _, sheet_rows, _ = read_jobs(spreadsheet)
     known = {job_key(r.get("Application URL", "")) for r in sheet_rows}
-    known |= load_seen(spreadsheet)
+    seen_keys = load_seen(spreadsheet)
+    known |= seen_keys
+    print(f"{len(known)} job(s) already known (sheet rows + Seen tab) will be skipped.")
     errors, seen_new = [], []
+    debug = os.environ.get("DEBUG_SITE", "").strip().lower()      # e.g. DEBUG_SITE=thermofisher
     samples = {}
 
     def note(reason, job, extra=""):
@@ -191,7 +202,12 @@ def main():
     def scan_site(site):
         host = urlparse(site).netloc.lower()
         out = []
-        for job in fetch_india_jobs(site, terms, max_jobs=cap):
+        listed = fetch_india_jobs(site, terms, max_jobs=cap)
+        if debug and debug in site.lower():
+            print(f"[debug] {site}: {len(listed)} India listing(s) after searching {len(terms)} terms")
+            for j in listed[:60]:
+                print(f"[debug]   listing: {j.get('title')} | {j.get('location')}")
+        for job in listed:
             known_name = COMPANY_NAMES.get(host)
             job["company_known"] = known_name
             job["company"] = known_name or pretty_company(job.get("company", ""))
@@ -226,6 +242,7 @@ def main():
         k = job_key(j.get("posting_url", ""))
         if k and k not in known:
             uniq.setdefault(k, j)
+    print(f"{len(uniq)} new of {len({job_key(j.get('posting_url', '')) for j in pending})} India jobs (rest already judged).")
     pending = sorted(uniq.items(), key=lambda kv: 0 if ("intern" in kv[1].get("title", "").lower() or "2027" in kv[1].get("title", "")) else 1)
     print(f"{len(pending)} new India job(s) to check ({elapsed():.1f} min elapsed).")
 
@@ -240,6 +257,8 @@ def main():
             return key, job, "not_india"
         job["location"] = pick_india_location(job)
         verdict = rule_based_evaluate(job)
+        if debug and debug in (job.get("career_site", "") or "").lower():
+            print(f"[debug] {job.get('title')} | {job.get('location')} -> {'PASS' if verdict['is_relevant'] else 'dropped: ' + verdict['why']}")
         if not verdict["is_relevant"]:
             note("filtered: " + verdict["why"], job)
             return key, job, "rule_reject"
