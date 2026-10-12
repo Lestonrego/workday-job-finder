@@ -349,12 +349,28 @@ def _add_candidate(url, found, hosts):
 
 
 def _resolve_host(host):
-    """Follow a bare tenant host's redirect to find its default career-site path."""
+    """Find a bare tenant host's career-site path: follow its root redirect, else try common site names."""
     try:
         response = requests.get(f"https://{host}/", headers=HEADERS, timeout=12, allow_redirects=True)
-        return _career_root(response.url)
     except Exception:
         return ""
+    root = _career_root(response.url)
+    if root:
+        return root
+    if response.status_code >= 400:
+        return ""
+    tenant = host.split(".")[0]
+    for site in ("External", "Careers", tenant, f"{tenant}Careers", "External_Career_Site", "ExternalCareerSite",
+                 "careers", "Jobs", "Global_Careers"):
+        try:
+            r = requests.post(f"https://{host}/wday/cxs/{tenant}/{site}/jobs",
+                              json={"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""},
+                              headers=HEADERS, timeout=10)
+            if r.status_code == 200 and "jobPostings" in r.json():
+                return f"https://{host}/en-US/{site}"
+        except Exception:
+            continue
+    return ""
 
 
 def _resolve_bare_hosts(found, hosts, max_sites):

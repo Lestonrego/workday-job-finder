@@ -72,7 +72,8 @@ _CURRENT = [0]
 
 
 def _load_keys():
-    raw = os.environ.get("GROQ_API_KEYS", "") + "\n" + os.environ.get("GROQ_API_KEY", "")
+    names = ["GROQ_API_KEYS", "GROQ_API_KEY"] + [f"GROQ_API_KEY_{i}" for i in range(2, 11)]
+    raw = "\n".join(os.environ.get(n, "") for n in names)
     keys = [k.strip() for k in re.split(r"[,\s;]+", raw) if k.strip()]
     return list(dict.fromkeys(keys))
 
@@ -278,3 +279,24 @@ def rule_based_evaluate(job):
         "employment_type": "Internship" if is_intern else (job.get("employment_type") or "Full time (entry-level)"),
         "eligibility_concerns": ["Keyword match only (AI review not completed); verify requirements"],
     }
+
+
+def suggest_tenants(names, deadline=None):
+    """Ask the LLM for the most likely Workday tenant ids (the part before .wdN.myworkdayjobs.com) of companies.
+    Only suggestions: every one is verified by probing before it is used. Returns {name: [slug, ...]}."""
+    listing = "\n".join(f"{i}. {n}" for i, n in enumerate(names, start=1))
+    system = ("You map company names to the Workday tenant id used in their career site address "
+              "https://<tenant>.wd<N>.myworkdayjobs.com. Tenant ids are lowercase, usually the short brand name "
+              "(e.g. 'Johnson & Johnson' -> 'jj', 'Thermo Fisher Scientific' -> 'thermofisher', 'Capgemini' -> 'capgemini'). "
+              "Reply ONLY as JSON: {\"items\":[{\"id\":1,\"tenants\":[\"a\",\"b\"]}]} with up to 3 likely ids per company, "
+              "most likely first; use an empty list when you do not know. Never invent long random strings.")
+    data = _call_groq(system, f"Companies:\n{listing}", deadline)
+    out = {}
+    for it in (data or {}).get("items", []):
+        try:
+            nm = names[int(it["id"]) - 1]
+        except Exception:
+            continue
+        slugs = [re.sub(r"[^a-z0-9-]", "", str(t).lower()) for t in (it.get("tenants") or [])]
+        out[nm] = [t for t in dict.fromkeys(slugs) if 2 < len(t) < 40][:3]
+    return out

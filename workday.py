@@ -367,6 +367,8 @@ def find_india_facet(career_url, session=None):
 def fetch_india_jobs(career_url, terms, max_jobs=300):
     """India listings for each search term. Uses the site's own India filter when it has one."""
     facet = find_india_facet(career_url)
+    if os.environ.get("DEBUG_SITE") and os.environ["DEBUG_SITE"].lower() in career_url.lower():
+        print(f"[debug] {career_url}: India filter = {facet!r} (None = site shows no India jobs, {{}} = no location filter, filtering locally)")
     if facet is None:
         return []                       # site lists locations but none are in India
     jobs, seen = [], set()

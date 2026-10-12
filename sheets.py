@@ -308,26 +308,32 @@ def upsert_job(spreadsheet, record):
 
 
 SEEN_TAB = "Seen"
+SEEN_VERSION = "v5"      # bump whenever the filtering rules change: older verdicts are then ignored automatically
 
 
 def load_seen(spreadsheet, days=7):
-    """Keys of postings already judged in the last `days` days (so they are never re-evaluated)."""
+    """Keys of postings already judged under the CURRENT rules in the last `days` days."""
     try:
         ws = spreadsheet.worksheet(SEEN_TAB)
     except Exception:
-        ws = spreadsheet.add_worksheet(title=SEEN_TAB, rows=1000, cols=2)
-        ws.update(range_name="A1:B1", values=[["Key", "Seen At"]])
+        ws = spreadsheet.add_worksheet(title=SEEN_TAB, rows=1000, cols=3)
+        ws.update(range_name="A1:C1", values=[["Key", "Seen At", "Rules"]])
         return set()
     values = ws.get_all_values()[1:]
     cutoff = datetime.now(IST) - timedelta(days=days)
-    keep = [r for r in values if len(r) >= 2 and (_parse_discovered_at(r[1]) or cutoff) > cutoff - timedelta(seconds=1)]
+    keep = []
+    for r in values:
+        r = r + [""] * (3 - len(r))
+        when = _parse_discovered_at(r[1])
+        if r[0] and r[2] == SEEN_VERSION and when and when > cutoff:
+            keep.append(r[:3])
     if len(keep) < len(values):
         ws.clear()
-        ws.update(range_name="A1:B1", values=[["Key", "Seen At"]])
+        ws.update(range_name="A1:C1", values=[["Key", "Seen At", "Rules"]])
         if keep:
-            ws.update(range_name=f"A2:B{len(keep) + 1}", values=keep, value_input_option="RAW")
-        print(f"Seen tab: pruned {len(values) - len(keep)} entries older than {days} days.")
-    return {r[0] for r in keep if r and r[0]}
+            ws.update(range_name=f"A2:C{len(keep) + 1}", values=keep, value_input_option="RAW")
+        print(f"Seen tab: dropped {len(values) - len(keep)} entries (older than {days} days or judged by older rules).")
+    return {r[0] for r in keep}
 
 
 def add_seen(spreadsheet, keys):
@@ -337,7 +343,7 @@ def add_seen(spreadsheet, keys):
     ws = spreadsheet.worksheet(SEEN_TAB)
     now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     for i in range(0, len(keys), 2000):
-        ws.append_rows([[k, now] for k in keys[i:i + 2000]], value_input_option="RAW")
+        ws.append_rows([[k, now, SEEN_VERSION] for k in keys[i:i + 2000]], value_input_option="RAW")
 
 
 def purge_rows(spreadsheet, should_delete):

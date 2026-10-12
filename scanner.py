@@ -14,7 +14,7 @@ from sheets import (get_spreadsheet, ensure_tabs, cleanup_expired_jobs, read_job
                     compact_blank_rows, remove_duplicate_rows, job_key, load_seen, add_seen, purge_rows)
 from workday import pretty_company, confirm_sites, discover_workday_sites, enrich_workday_job, fetch_india_jobs
 from discovery import discover_workday_sites_from_search, COMPANY_NAMES, _career_root, _resolve_host, _host_of, _discover_github_listings
-from matcher import evaluate_jobs_batch, now_ist, rule_based_evaluate, QuotaExhausted, required_years
+from matcher import suggest_tenants, evaluate_jobs_batch, now_ist, rule_based_evaluate, QuotaExhausted, required_years
 from pypdf import PdfReader
 
 load_dotenv()
@@ -118,20 +118,33 @@ def site_key(url):
     return p.netloc.lower() + "/" + p.path.strip("/").split("/")[-1].lower()
 
 
+def _clean_name(name):
+    """Fix garbled characters and strip notes like '(formerly X)', ', LLC', ' - Division', 'a division of Y'."""
+    n = name or ""
+    if "Ã" in n or "â" in n:
+        try:
+            n = n.encode("latin-1").decode("utf-8")
+        except Exception:
+            pass
+    n = re.sub(r"\(.*?\)", " ", n)
+    n = re.split(r",| - | – |\ba (?:division|subsidiary|member|part) of\b", n, flags=re.I)[0]
+    return n.strip()
+
+
 def _tenant_guesses(name):
-    words = [w for w in re.sub(r"\(.*?\)", " ", name.lower().replace("&", " ")).split()]
-    words = [re.sub(r"[^a-z0-9]", "", w) for w in words]
+    clean = _clean_name(name)
+    words = [re.sub(r"[^a-z0-9]", "", w) for w in clean.lower().replace("&", " ").split()]
     words = [w for w in words if w and w not in _SUFFIX]
     guesses = []
     if words:
-        for g in ("".join(words), "".join(words[:2]), words[0]):
+        for g in ("".join(words), "".join(words[:2]), words[0], "-".join(words)):
             if g and g not in guesses and len(g) > 2:
                 guesses.append(g)
     return guesses
 
 
 def _squash(name):
-    words = [re.sub(r"[^a-z0-9]", "", w) for w in re.sub(r"\(.*?\)", " ", (name or "").lower().replace("&", " ")).split()]
+    words = [re.sub(r"[^a-z0-9]", "", w) for w in _clean_name(name).lower().replace("&", " ").split()]
     return "".join(w for w in words if w and w not in _SUFFIX)
 
 
@@ -168,6 +181,7 @@ def load_company_csv(known_sites=(), known_names=None):
             name_col = 0
 
     urls, names, nameless = [], {}, []
+    industry = {}
     for r in rows:
         cells = [(c or "").strip() for c in r]
         name = ""
@@ -188,8 +202,10 @@ def load_company_csv(known_sites=(), known_names=None):
                         urls.append(root)
                         if name:
                             names[urlparse(root).netloc.lower()] = name
-        elif name:
+        elif name and re.search(r"[A-Za-z]{2}", _clean_name(name)):
             nameless.append(name)
+            if len(cells) > 1:
+                industry[name] = " ".join(c for i, c in enumerate(cells) if i != name_col).lower()
     nameless = list(dict.fromkeys(nameless))
 
     # -- match against employers the scan already knows
@@ -217,31 +233,81 @@ def load_company_csv(known_sites=(), known_names=None):
 
     # -- probe likely Workday addresses for the rest (cached)
     try:
-        probed = json.loads(CSV_CACHE.read_text(encoding="utf-8")).get("probed", {})
+        _c = json.loads(CSV_CACHE.read_text(encoding="utf-8"))
+        probed = _c.get("probed", {})
+        globals()["_LLM_DONE"] = _c.get("llm_done", [])
     except Exception:
         probed = {}
-    todo = [n for n in unmatched if n not in probed][: int(os.environ.get("CSV_RESOLVE_MAX", "1500"))]
+    todo = [n for n in unmatched if n not in probed]
+    _HOT = re.compile(r"software|it services|information|technology|internet|data|analytics|consult|financ|bank|insur|"
+                      r"semiconductor|electronic|biotech|pharma|research|telecom|engineering|automotive|manufactur|"
+                      r"computer|e-learning|machinery|medical", re.I)
+    todo.sort(key=lambda n: 0 if _HOT.search(industry.get(n, "")) else 1)
     if todo:
         from concurrent.futures import ThreadPoolExecutor as _TP
-        tasks = [(n, g, s) for n in todo for g in _tenant_guesses(n)[:2] for s in SHARDS]
-        print(f"workday_companies.csv: probing {len(tasks)} likely Workday addresses for {len(todo)} company name(s) (cached afterwards).", flush=True)
+        budget = float(os.environ.get("CSV_PROBE_MIN", "12")) * 60
+        print(f"workday_companies.csv: {len(todo)} company name(s) still to check on Workday; "
+              f"checking for up to {budget/60:.0f} min now, the rest continue on the next runs (progress is cached).", flush=True)
 
-        def probe(task):
-            nm, guess, shard = task
-            return nm, _resolve_host(f"{guess}.wd{shard}.myworkdayjobs.com")
+        def probe_name(nm):
+            for g in _tenant_guesses(nm)[:3]:
+                for sh in SHARDS:
+                    root = _resolve_host(f"{g}.wd{sh}.myworkdayjobs.com")
+                    if root:
+                        return nm, [root]
+            return nm, []
 
-        found_by = {n: [] for n in todo}
-        with _TP(max_workers=24) as pool:
-            for nm, root in pool.map(probe, tasks):
-                if root:
-                    found_by[nm].append(root)
-        for nm, roots in found_by.items():
-            probed[nm] = list(dict.fromkeys(roots))
+        t0 = time.time()
+        done = 0
+        with _TP(max_workers=32) as pool:
+            for i in range(0, len(todo), 200):
+                if time.time() - t0 > budget:
+                    break
+                for nm, roots in pool.map(probe_name, todo[i:i + 200]):
+                    probed[nm] = roots
+                    done += 1
+                try:
+                    CSV_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                    CSV_CACHE.write_text(json.dumps({"probed": probed, "llm_done": sorted(globals().get("_LLM_DONE", []))}), encoding="utf-8")
+                except Exception:
+                    pass
+        # LLM pass: for names the plain guesses missed, let the LLM suggest the real tenant id, then verify by probing
+        llm_cap = int(os.environ.get("CSV_LLM_MAX", "400"))
         try:
-            CSV_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            CSV_CACHE.write_text(json.dumps({"probed": probed}), encoding="utf-8")
+            llm_done = set(json.loads(CSV_CACHE.read_text(encoding="utf-8")).get("llm_done", []))
         except Exception:
-            pass
+            llm_done = set()
+        cand = [n for n in unmatched if n in probed and not probed[n] and n not in llm_done][:llm_cap]
+        if cand and "".join(v for k, v in os.environ.items() if k.startswith("GROQ_API_KEY")):
+            found_llm = 0
+            def probe_slugs(item):
+                nm, slugs = item
+                for g in slugs:
+                    for sh in SHARDS:
+                        root = _resolve_host(f"{g}.wd{sh}.myworkdayjobs.com")
+                        if root:
+                            return nm, [root]
+                return nm, []
+            try:
+                with _TP(max_workers=32) as pool:
+                    for i in range(0, len(cand), 40):
+                        if time.time() - t0 > budget + 180:
+                            break
+                        chunk = cand[i:i + 40]
+                        sug = suggest_tenants(chunk)
+                        for nm, roots in pool.map(probe_slugs, list(sug.items())):
+                            if roots:
+                                probed[nm] = roots
+                                found_llm += 1
+                        llm_done.update(chunk)
+            except Exception as e:
+                print(f"workday_companies.csv: LLM name help stopped ({str(e)[:80]}); continuing.", flush=True)
+            try:
+                CSV_CACHE.write_text(json.dumps({"probed": probed, "llm_done": sorted(llm_done)}), encoding="utf-8")
+            except Exception:
+                pass
+            print(f"workday_companies.csv: LLM suggested addresses for {len(llm_done & set(cand))} name(s); {found_llm} more found on Workday.", flush=True)
+        print(f"workday_companies.csv: checked {done} name(s) this run, {len(todo) - done} left for later runs.", flush=True)
     probed_hits = 0
     for nm in unmatched:
         for root in probed.get(nm, []):
@@ -250,7 +316,7 @@ def load_company_csv(known_sites=(), known_names=None):
         probed_hits += 1 if probed.get(nm) else 0
     urls = list(dict.fromkeys(urls))
     stats = (f"{len(rows)} row(s); {len(nameless)} company name(s): {matched_known} matched employers already known, "
-             f"{probed_hits} found by probing, {len(unmatched) - probed_hits} have no Workday site; {len(urls)} site(s) in total")
+             f"{probed_hits} found by probing, {sum(1 for n in unmatched if n in probed and not probed[n])} have no Workday site, {sum(1 for n in unmatched if n not in probed)} not checked yet; {len(urls)} site(s) in total")
     return urls, names, stats
 
 
