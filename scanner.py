@@ -14,7 +14,7 @@ from sheets import (get_spreadsheet, ensure_tabs, cleanup_expired_jobs, read_job
                     compact_blank_rows, remove_duplicate_rows, job_key, load_seen, add_seen, purge_rows)
 from workday import pretty_company, confirm_sites, discover_workday_sites, enrich_workday_job, fetch_india_jobs
 from discovery import discover_workday_sites_from_search, COMPANY_NAMES, _career_root, _resolve_host, _host_of, _discover_github_listings
-from matcher import suggest_tenants, evaluate_jobs_batch, now_ist, rule_based_evaluate, QuotaExhausted, required_years
+from matcher import title_is_tech, LEVEL_TITLE, suggest_tenants, evaluate_jobs_batch, now_ist, rule_based_evaluate, QuotaExhausted, required_years
 from pypdf import PdfReader
 
 load_dotenv()
@@ -410,8 +410,11 @@ def main():
 
     def low_quality(row):
         note = (row.get("Eligibility Concerns") or "").lower()
+        title = row.get("Job Title", "")
         if "ai review not completed" in note or "keyword match only" in note:
-            return not rule_based_evaluate({"title": row.get("Job Title", ""), "description": ""})["is_relevant"]
+            return True                              # never keep unreviewed rows
+        if not title_is_tech(title) or LEVEL_TITLE.search(title) and "intern" not in title.lower():
+            return True
         return bool(re.search(r"does not meet|not meet|\d+\s*[-\u2013+]\s*\d*\s*years|\d+\+?\s*years|lacks|missing required", note))
 
     purge_rows(spreadsheet, low_quality)          # clean up junk written by earlier runs
@@ -566,18 +569,18 @@ def main():
             try:
                 results = evaluate_jobs_batch(resume, [j for _, j in chunk], deadline=ai_deadline)
             except QuotaExhausted as exc:
-                print(f"{exc} Saving the rest as unverified.")
+                print(f"{exc} The rest will be reviewed on the next run.")
                 ai_ok = False
                 break
             index += len(chunk)
             records, keys = [], []
             for (key, job), result in zip(chunk, results):
-                if result is None:                      # model skipped it: keep for manual review
-                    records.append(to_record(job, None, unverified=True))
+                if result is None:                      # model skipped it: retry on the next run (not saved, not remembered)
+                    continue
                 elif required_years(job.get("description", "")) >= 1 and "intern" not in job.get("title", "").lower():
                     stats["ai_reject"] += 1          # JD demands experience; never trust the AI over that
                     note("JD requires experience (override)", job)
-                elif result.get("is_relevant") and float(result.get("match_score") or 0) >= float(os.environ.get("MIN_MATCH_SCORE", "50")):
+                elif result.get("is_relevant") and float(result.get("match_score") or 0) >= float(os.environ.get("MIN_MATCH_SCORE", "65")):
                     records.append(to_record(job, result))
                     print(f"Match: {job.get('company')} | {job.get('title')} | {job.get('location')}")
                 else:
@@ -590,13 +593,9 @@ def main():
         errors.append(f"AI review stopped: {exc}")
         print(f"AI review stopped: {exc}")
     finally:
-        # Anything the AI did not get to is still saved so you can check it manually.
-        leftovers = shortlist[index:]
-        if leftovers:
-            cap_unverified = int(os.environ.get("MAX_UNVERIFIED", "40"))
-            take = leftovers[:cap_unverified]          # internships / 2027 roles come first
-            write([to_record(j, None, unverified=True) for _, j in take], [k for k, _ in take])
-            print(f"Saved {len(take)} job(s) without AI review; {len(leftovers) - len(take)} left for the next run.")
+        left = len(shortlist) - index
+        if left > 0:
+            print(f"{left} shortlisted job(s) were not reviewed (AI limit); they are retried first on the next run. Nothing unverified is saved.")
         add_seen(spreadsheet, seen_new)
 
     cleanup_expired_jobs(spreadsheet, max_age_days=3)

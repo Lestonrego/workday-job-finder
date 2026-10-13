@@ -106,7 +106,7 @@ def _call_groq(system, user, deadline=None):
             print(f"All {len(keys)} Groq key(s) limited; waiting {wait:.0f}s as instructed.", flush=True)
             time.sleep(max(1, wait))
             continue
-        idx = _CURRENT[0] if _CURRENT[0] in free else free[0]
+        idx = next((i for i in list(range(_CURRENT[0], len(keys))) + list(range(0, _CURRENT[0])) if i in free), free[0])
         _CURRENT[0] = idx
         key = keys[idx]
         client = Groq(api_key=key, timeout=90.0, max_retries=0)
@@ -116,6 +116,7 @@ def _call_groq(system, user, deadline=None):
             if extra:
                 kwargs["extra_body"] = extra
             completion = client.chat.completions.create(**kwargs)
+            _CURRENT[0] = (idx + 1) % len(keys)          # round-robin: spread calls across all keys
             return json.loads(completion.choices[0].message.content)
         except Exception as exc:
             message = str(exc).lower()
@@ -134,8 +135,8 @@ def _call_groq(system, user, deadline=None):
 
 BATCH_SYSTEM = SYSTEM_PROMPT.split("Return valid JSON only")[0] + """
 You will receive several jobs, each with an id. Judge every job independently.
-Decide like a careful recruiter reading the job description. Set is_relevant=true when ALL are true: (a) it is an internship or a genuine fresher/graduate/entry-level job, and the description does NOT demand prior professional experience (reject "1+ years", "2-5 years", mid-level or senior roles); (b) the role is in AI/ML, data science/analytics/engineering, software/IT, or a closely related technical field that the resume supports; (c) the candidate could realistically do it - a few missing or learnable skills are fine, but reject if the core required skills are clearly absent. Reject non-technical roles (operations, finance, sales, HR, legal, mechanical, etc.) even when titled intern. Roles starting in 2026 or 2027 are valid. If (a) and (b) hold and you are only unsure about skills, accept with a lower score (50-65).
-Also give match_score 0-100 (resume fit); 60+ means a strong match, 50-59 an acceptable one.
+Decide like a careful recruiter reading the job description. Set is_relevant=true when ALL are true: (a) it is an internship or a genuine fresher/graduate/entry-level job, and the description does NOT demand prior professional experience (reject "1+ years", "2-5 years", mid-level or senior roles); (b) the role is in AI/ML, data science/analytics/engineering, software/IT, or a closely related technical field that the resume supports; (c) the candidate could realistically do it - a few missing or learnable skills are fine, but reject if the core required skills are clearly absent. Reject non-technical roles (operations, finance, sales, HR, legal, mechanical, etc.) even when titled intern. Roles starting in 2026 or 2027 are valid. Be strict: the candidate wants to apply only to roles that are a genuine fit, so when the description shows the work is mainly operations, support, finance, quality, sales, plant or office administration, or needs experience, reject it. If (a) and (b) hold and you are only unsure about a few learnable skills, accept with a score of 65-75.
+Also give match_score 0-100 (resume fit); 75+ means a strong match, 65-74 an acceptable one; anything below 65 is a reject.
 Return valid JSON only, exactly this shape, with one entry per job id:
 {"results": [{"id": 1, "is_relevant": true, "match_score": 80, "employment_type": "Internship or Full-time", "company_name": "official company name if you can tell it from the description, else empty", "eligibility_concerns": ["short note"], "reasoning": "one short sentence"}]}
 """
@@ -205,6 +206,25 @@ FIELD_TITLE = re.compile(
     r"\b(software|developer|development|programmer|full[- ]?stack|back[- ]?end|front[- ]?end|web|cloud|devops|sde|swe|"
     r"data|analytics?|machine learning|ml|ai|artificial intelligence|nlp|genai|generative|llm|python|sql|"
     r"research|computer|information technology|it|cyber|automation|engineering|engineer)\b", re.I)
+TECH_TITLE = re.compile(
+    r"\b(software|developer|development|programmer|full[- ]?stack|back[- ]?end|front[- ]?end|web|cloud|devops|sde|swe|"
+    r"data|analytics?|analyst|machine learning|ml|ai|artificial intelligence|nlp|genai|generative|llm|python|sql|"
+    r"research|computer|cyber|automation|qa|sdet|test automation|application|applications|java|\.net|react|"
+    r"digital|technology|technical|information technology|it systems|business intelligence|bi)\b", re.I)
+LEVEL_TITLE = re.compile(r"\b(associate|engineer|developer|analyst|specialist)\s*(ii|iii|iv|v|[2-9])\b|\b(level|grade|l)\s*[2-9]\b|\b[2-9]\s*$", re.I)
+NONTECH_TITLE = re.compile(
+    r"\b(process associate|support associate|back office|operations?|contracts?|pricing|quality|complaints?|regulatory|"
+    r"reporting|investor|accounts? (receivable|payable)|retail|store|production|mechanical|electrical|civil|chemical|"
+    r"manufacturing|maintenance|operator|technician|machinist|welfare|buyer|artwork|copywriter|facilit\w+|"
+    r"customer|helpdesk|help desk|desktop support|service desk|taxation|ca\b|chartered)\b", re.I)
+
+
+def title_is_tech(title):
+    """True when the TITLE itself points to software / data / AI / IT work (bare 'Engineer' is not enough)."""
+    return bool(TECH_TITLE.search(title or "")) and not (NONTECH_TITLE.search(title or "") and not re.search(
+        r"\b(software|developer|data|ai|ml|machine learning|python|sql|analytics)\b", title or "", re.I))
+
+
 STRONG_DESC = re.compile(
     r"\b(python|sql|machine learning|deep learning|data science|data analysis|data analytics|software development|"
     r"programming|nlp|generative ai|llm|power bi|tableau|pandas|tensorflow|pytorch)\b", re.I)
@@ -262,16 +282,19 @@ def rule_based_evaluate(job):
     is_intern = bool(re.search(r"\b(intern(ship)?s?|trainee|apprentice)\b", title, re.I))
     years = required_years(desc) or (1 if re.search(r"\b\d\s*[-–+]\s*\d?\s*(years|yrs)\b", title, re.I) else 0)
     entry = bool(ENTRY_TITLE.search(title)) or bool(JD_ENTRY.search(desc))
-    tech = bool(FIELD_TITLE.search(title)) or len(set(x.group(0).lower() for x in STRONG_DESC.finditer(desc))) >= 2
+    tech = title_is_tech(title) or (len(set(x.group(0).lower() for x in STRONG_DESC.finditer(desc))) >= (2 if is_intern else 3)
+                                    and not NONTECH_TITLE.search(title) and not UNRELATED_TITLE.search(title))
     why = ""
     if not entry:
         why = "no entry-level signal in title or JD"
     elif SENIOR_TITLE.search(title) and not is_intern:
         why = "senior title"
+    elif LEVEL_TITLE.search(title) and not is_intern:
+        why = "mid-level title (level 2+)"
+    elif not tech:
+        why = "not a software / data / AI role"
     elif years >= 1 and not is_intern:
         why = f"JD requires {years}+ years experience"
-    elif UNRELATED_TITLE.search(title) and not tech:
-        why = "non-technical role"
     relevant = not why
     return {
         "is_relevant": relevant,
